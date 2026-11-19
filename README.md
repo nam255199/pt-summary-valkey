@@ -30,11 +30,11 @@ Output: the text report on stdout, plus `./pt-summary-valkey_<host>_<port>_<time
 ### Customer / support workflow
 
 ```bash
-# Customer: collect only, then send the .tar.gz
+# collect only, then send the .tar.gz
 ./pt-summary-valkey -h 10.0.0.5 -p 6379 --ask-pass --collect-only
 # -> ./pt-summary-valkey_10.0.0.5_6379_20261119_101500.tar.gz
 
-# Support engineer: build the reports offline
+# build the reports offline
 tar xzf pt-summary-valkey_10.0.0.5_6379_20261119_101500.tar.gz
 ./pt-summary-valkey --from-dir pt-summary-valkey_10.0.0.5_6379_20261119_101500
 ```
