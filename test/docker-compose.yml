@@ -1,0 +1,50 @@
+# Test lab for pt-summary-valkey
+#   standalone : valkey-standalone:6379 (no password, protected-mode off -> security findings)
+#   replication: valkey-primary:6379 + valkey-replica:6379 (password "secret")
+#   cluster    : valkey-c1..c6:7000 (3 primaries + 3 replicas, password "secret")
+#   runner     : container with valkey-cli + bash that runs the tool
+#
+# Usage: see test/run-tests.sh
+name: ptsv-lab
+
+x-valkey: &valkey
+  image: valkey/valkey:${VALKEY_VERSION:-8.1}
+  networks: [lab]
+
+x-cluster-node: &cluster-node
+  <<: *valkey
+  command: >
+    valkey-server --port 7000 --cluster-enabled yes --cluster-config-file nodes.conf
+    --cluster-node-timeout 5000 --appendonly yes --requirepass secret --masterauth secret
+    --maxmemory 256mb --maxmemory-policy allkeys-lru --latency-monitor-threshold 50
+
+services:
+  valkey-standalone:
+    <<: *valkey
+    command: valkey-server --protected-mode no --save "" --appendonly no --slowlog-log-slower-than 0
+
+  valkey-primary:
+    <<: *valkey
+    command: valkey-server --requirepass secret --masterauth secret --maxmemory 128mb --maxmemory-policy volatile-lru
+
+  valkey-replica:
+    <<: *valkey
+    command: valkey-server --requirepass secret --masterauth secret --replicaof valkey-primary 6379 --maxmemory 64mb
+    depends_on: [valkey-primary]
+
+  valkey-c1: { <<: *cluster-node }
+  valkey-c2: { <<: *cluster-node }
+  valkey-c3: { <<: *cluster-node }
+  valkey-c4: { <<: *cluster-node }
+  valkey-c5: { <<: *cluster-node }
+  valkey-c6: { <<: *cluster-node }
+
+  runner:
+    <<: *valkey
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ..:/work
+    working_dir: /work
+
+networks:
+  lab: {}

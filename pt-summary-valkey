@@ -1,0 +1,2157 @@
+#!/usr/bin/env bash
+#
+# pt-summary-valkey - Summarize and health-check Valkey / Redis OSS deployments.
+#
+# Connects to a standalone instance, a primary/replica group or a cluster,
+# collects INFO, CONFIG, CLUSTER, SLOWLOG, LATENCY, MEMORY, CLIENT and ACL
+# data from every node it can reach, runs health checks, prints a
+# pt-summary style text report and writes a self-contained HTML report.
+#
+# Requirements: bash >= 4.2, awk, sed, sort, valkey-cli or redis-cli.
+# Run "pt-summary-valkey --help" for usage.
+#
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] ||
+   { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
+  echo "pt-summary-valkey: bash >= 4.2 is required" >&2
+  exit 1
+fi
+
+set -o pipefail
+shopt -u patsub_replacement 2>/dev/null || true
+export LC_ALL=C
+export TZ=UTC
+
+readonly VERSION="1.0"
+readonly TOOL="pt-summary-valkey"
+
+# --------------------------------------------------------------- defaults ---
+HOST="127.0.0.1"
+PORT="6379"
+ACL_USER=""
+PASSWORD="${VALKEYCLI_AUTH:-${REDISCLI_AUTH:-}}"
+ASK_PASS=0
+CLI=""
+TLS=0; CACERT=""; CACERTDIR=""; CERT=""; KEY=""; SNI=""; INSECURE=0
+DISCOVER=1
+NODES_OPT=""
+MAX_NODES=500
+SLOWLOG_N=128
+CLIENT_LIST=1
+BIGKEYS=0
+OS_MODE="auto"
+OUTDIR=""
+HTML=""
+FROM_DIR=""
+COLLECT_ONLY=0
+TEXT=1
+QUIET=0
+CMD_TIMEOUT=30
+TIMEOUT_BIN=""
+LOCAL_FOUND=0
+LAST_ERR=""
+
+# Configuration parameters that are expected to differ between nodes.
+NODE_SPECIFIC_CFG=" port tls-port pidfile logfile dir dbfilename appendfilename appenddirname
+ cluster-config-file cluster-announce-ip cluster-announce-port cluster-announce-bus-port
+ cluster-announce-tls-port cluster-announce-hostname cluster-announce-human-nodename
+ cluster-announce-client-ipv4 cluster-announce-client-ipv6 cluster-port replicaof slaveof bind
+ bind-source-addr unixsocket syslog-ident replica-announce-ip replica-announce-port
+ slave-announce-ip slave-announce-port masterauth requirepass tls-cert-file tls-key-file
+ tls-client-cert-file tls-client-key-file tls-ca-cert-file tls-ca-cert-dir tls-dh-params-file
+ unixsocketperm daemonize supervised "
+
+# Parameters shown in the key configuration table and checked for drift.
+KEY_CFG="maxmemory maxmemory-policy maxmemory-clients save appendonly appendfsync
+ aof-use-rdb-preamble io-threads maxclients timeout tcp-keepalive tcp-backlog hz activedefrag
+ lazyfree-lazy-eviction lazyfree-lazy-expire lazyfree-lazy-server-del lazyfree-lazy-user-del
+ replica-lazy-flush repl-backlog-size repl-diskless-sync client-output-buffer-limit
+ min-replicas-to-write replica-read-only cluster-node-timeout cluster-require-full-coverage
+ cluster-allow-reads-when-down cluster-replica-validity-factor slowlog-log-slower-than
+ slowlog-max-len latency-monitor-threshold protected-mode enable-debug-command
+ enable-module-command stop-writes-on-bgsave-error"
+
+# ------------------------------------------------------------------ usage ---
+usage() {
+  cat <<EOF
+$TOOL $VERSION
+
+Collect and health-check a Valkey / Redis OSS standalone instance, primary /
+replica group or cluster. Prints a pt-summary style report and writes a
+self-contained HTML health report with findings and recommendations.
+
+Usage: $TOOL [OPTIONS]
+
+Connection:
+  -h, --host HOST        Seed host (default: 127.0.0.1)
+  -p, --port PORT        Seed port (default: 6379)
+      --user USER        ACL username
+  -a, --password PASS    Password (visible in the process list; prefer the
+                         VALKEYCLI_AUTH / REDISCLI_AUTH variables or --ask-pass)
+      --ask-pass         Prompt for the password
+      --tls              Use TLS (also --cacert FILE, --cacertdir DIR, --cert FILE,
+                         --key FILE, --sni NAME, --insecure)
+      --cli PATH         valkey-cli or redis-cli binary (default: auto-detect)
+      --timeout SEC      Timeout for each command (default: $CMD_TIMEOUT)
+
+Discovery:
+      --no-discover      Collect only the seed node
+      --nodes LIST       Comma separated host:port list to collect (no discovery)
+      --max-nodes N      Stop after N nodes (default: $MAX_NODES)
+
+Collection:
+      --slowlog N        SLOWLOG entries per node (default: $SLOWLOG_N)
+      --no-client-list   Skip CLIENT LIST
+      --bigkeys          Also run --bigkeys and --memkeys on primaries.
+                         This SCANs the whole keyspace and adds load.
+      --os | --no-os     Force or skip local OS collection (default: collect
+                         when a node runs on this host)
+
+Output:
+  -o, --output-dir DIR   Directory for raw data and reports
+                         (default: ./${TOOL}_<host>_<port>_<timestamp>)
+      --html FILE        HTML report path (default: <output-dir>/report.html)
+      --collect-only     Only collect and pack <output-dir>.tar.gz (to send to
+                         support); build the report later with --from-dir
+      --from-dir DIR     Build the reports from a collected directory (offline)
+      --no-text          Do not print the text report
+  -q, --quiet            No progress messages
+      --version          Print the version
+      --help             Print this help
+
+Required privileges: INFO, CONFIG GET, CLUSTER INFO/NODES, SLOWLOG GET,
+LATENCY LATEST/DOCTOR, MEMORY DOCTOR/STATS, CLIENT LIST, ACL LIST.
+Missing privileges are reported and the related checks are skipped.
+
+Examples:
+  $TOOL -h 10.0.0.5 -p 6379 --ask-pass
+  VALKEYCLI_AUTH=secret $TOOL -h node1 -p 7000 --user monitor
+  $TOOL -h 10.0.0.5 --collect-only          # customer side
+  $TOOL --from-dir ./${TOOL}_10.0.0.5_6379_20261119_101500   # support side
+EOF
+}
+
+# ---------------------------------------------------------------- helpers ---
+log()  { (( QUIET )) || printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
+warn() { printf '%s: WARNING: %s\n' "$TOOL" "$*" >&2; }
+die()  { printf '%s: ERROR: %s\n' "$TOOL" "$*" >&2; exit 1; }
+
+isnum() { [[ ${1:-} =~ ^[0-9]+$ ]]; }
+
+# hb BYTES -> human readable size
+hb() {
+  local b=${1:-0} u=(B K M G T P) i=0 f=0
+  isnum "$b" || { printf '%s' "$b"; return; }
+  while (( b >= 1024 && i < 5 )); do f=$(( (b % 1024) * 10 / 1024 )); b=$(( b / 1024 )); ((i++)); done
+  if (( i == 0 )); then printf '%dB' "$b"; else printf '%d.%d%s' "$b" "$f" "${u[i]}"; fi
+}
+
+# hdur SECONDS -> "2d 3h"
+hdur() {
+  local s=${1:-0}
+  isnum "$s" || { printf '%s' "$s"; return; }
+  local d=$((s/86400)) h=$((s%86400/3600)) m=$((s%3600/60)) x=$((s%60))
+  if (( d )); then printf '%dd %dh' "$d" "$h"
+  elif (( h )); then printf '%dh %dm' "$h" "$m"
+  elif (( m )); then printf '%dm %ds' "$m" "$x"
+  else printf '%ds' "$x"; fi
+}
+
+# tsd EPOCH -> "YYYY-mm-dd HH:MM:SS"
+tsd() { isnum "${1:-}" && printf '%(%Y-%m-%d %H:%M:%S)T' "$1" || printf '%s' "${1:-}"; }
+
+# commas 1234567 -> 1,234,567
+commas() {
+  local n=${1:-0} s=""
+  isnum "$n" || { printf '%s' "$n"; return; }
+  while (( ${#n} > 3 )); do s=",${n: -3}$s"; n=${n:0:${#n}-3}; done
+  printf '%s' "$n$s"
+}
+
+# f100 VAR "1.23" -> VAR=123 (fixed point, 2 decimals)
+f100() {
+  local v=${2:-0} i f
+  [[ $v == -* || -z $v ]] && { printf -v "$1" '%d' 0; return; }
+  i=${v%%.*}; if [[ $v == *.* ]]; then f=${v#*.}; else f=0; fi
+  i=${i//[^0-9]/}; f=${f//[^0-9]/}; f="${f}00"; f=${f:0:2}
+  printf -v "$1" '%d' $(( 10#${i:-0} * 100 + 10#$f ))
+}
+
+# kv VAR "a=1,b=2" key -> VAR=value of key
+kv() {
+  local s=",$2," r=""
+  if [[ $s == *",$3="* ]]; then r=${s#*",$3="}; r=${r%%,*}; fi
+  printf -v "$1" '%s' "$r"
+}
+
+# verint VAR "7.2.4" -> 70204
+verint() {
+  local a b c
+  IFS=. read -r a b c <<< "${2:-0}"
+  a=${a//[^0-9]/}; b=${b//[^0-9]/}; c=${c//[^0-9]/}
+  printf -v "$1" '%d' $(( 10#${a:-0} * 10000 + 10#${b:-0} * 100 + 10#${c:-0} ))
+}
+
+# he STRING -> HTML escaped
+he() {
+  local s=$1
+  s=${s//'&'/'&amp;'}; s=${s//'<'/'&lt;'}; s=${s//'>'/'&gt;'}; s=${s//'"'/'&quot;'}
+  printf '%s' "$s"
+}
+
+kvp() { printf '%s\t%s\n' "$1" "$2"; }
+
+# ------------------------------------------------------------- arguments ---
+need_arg() { [[ $# -ge 2 && -n $2 ]] || die "option $1 requires a value"; }
+
+parse_args() {
+  while (( $# )); do
+    if [[ $1 == --*=* ]]; then set -- "${1%%=*}" "${1#*=}" "${@:2}"; fi
+    case $1 in
+      -h|--host)       need_arg "$@"; HOST=$2; shift 2 ;;
+      -p|--port)       need_arg "$@"; PORT=$2; shift 2 ;;
+      --user)          need_arg "$@"; ACL_USER=$2; shift 2 ;;
+      -a|--password|--pass) need_arg "$@"; PASSWORD=$2; shift 2 ;;
+      --ask-pass)      ASK_PASS=1; shift ;;
+      --tls)           TLS=1; shift ;;
+      --cacert)        need_arg "$@"; CACERT=$2; TLS=1; shift 2 ;;
+      --cacertdir)     need_arg "$@"; CACERTDIR=$2; TLS=1; shift 2 ;;
+      --cert)          need_arg "$@"; CERT=$2; TLS=1; shift 2 ;;
+      --key)           need_arg "$@"; KEY=$2; TLS=1; shift 2 ;;
+      --sni)           need_arg "$@"; SNI=$2; TLS=1; shift 2 ;;
+      --insecure)      INSECURE=1; TLS=1; shift ;;
+      --cli)           need_arg "$@"; CLI=$2; shift 2 ;;
+      --timeout)       need_arg "$@"; CMD_TIMEOUT=$2; shift 2 ;;
+      --no-discover)   DISCOVER=0; shift ;;
+      --nodes)         need_arg "$@"; NODES_OPT=$2; shift 2 ;;
+      --max-nodes)     need_arg "$@"; MAX_NODES=$2; shift 2 ;;
+      --slowlog)       need_arg "$@"; SLOWLOG_N=$2; shift 2 ;;
+      --no-client-list) CLIENT_LIST=0; shift ;;
+      --bigkeys)       BIGKEYS=1; shift ;;
+      --os)            OS_MODE="on"; shift ;;
+      --no-os)         OS_MODE="off"; shift ;;
+      -o|--output-dir) need_arg "$@"; OUTDIR=$2; shift 2 ;;
+      --html)          need_arg "$@"; HTML=$2; shift 2 ;;
+      --collect-only)  COLLECT_ONLY=1; shift ;;
+      --from-dir)      need_arg "$@"; FROM_DIR=$2; shift 2 ;;
+      --no-text)       TEXT=0; shift ;;
+      -q|--quiet)      QUIET=1; shift ;;
+      --version)       echo "$TOOL $VERSION"; exit 0 ;;
+      --help)          usage; exit 0 ;;
+      *) die "unknown option: $1 (see --help)" ;;
+    esac
+  done
+  isnum "$PORT" || die "invalid port: $PORT"
+  isnum "$SLOWLOG_N" || die "invalid --slowlog value: $SLOWLOG_N"
+  isnum "$CMD_TIMEOUT" || die "invalid --timeout value: $CMD_TIMEOUT"
+  isnum "$MAX_NODES" || die "invalid --max-nodes value: $MAX_NODES"
+}
+
+# ------------------------------------------------------------- valkey-cli ---
+find_cli() {
+  if [[ -n $CLI ]]; then
+    command -v "$CLI" >/dev/null 2>&1 || die "client binary not found: $CLI"
+  else
+    CLI=$(command -v valkey-cli 2>/dev/null || command -v redis-cli 2>/dev/null) ||
+      die "valkey-cli or redis-cli not found in PATH (use --cli)"
+  fi
+  TIMEOUT_BIN=$(command -v timeout 2>/dev/null || true)
+}
+
+cli() {
+  local h=$1 p=$2; shift 2
+  local -a cmd=()
+  [[ -n $TIMEOUT_BIN ]] && cmd+=("$TIMEOUT_BIN" "$CMD_TIMEOUT")
+  cmd+=("$CLI" -h "$h" -p "$p")
+  [[ -n $ACL_USER ]] && cmd+=(--user "$ACL_USER")
+  if (( TLS )); then
+    cmd+=(--tls)
+    [[ -n $CACERT ]]    && cmd+=(--cacert "$CACERT")
+    [[ -n $CACERTDIR ]] && cmd+=(--cacertdir "$CACERTDIR")
+    [[ -n $CERT ]]      && cmd+=(--cert "$CERT")
+    [[ -n $KEY ]]       && cmd+=(--key "$KEY")
+    [[ -n $SNI ]]       && cmd+=(--sni "$SNI")
+    (( INSECURE ))      && cmd+=(--insecure)
+  fi
+  if [[ -n $PASSWORD ]]; then
+    VALKEYCLI_AUTH="$PASSWORD" REDISCLI_AUTH="$PASSWORD" "${cmd[@]}" "$@" < /dev/null
+  else
+    env -u VALKEYCLI_AUTH -u REDISCLI_AUTH "${cmd[@]}" "$@" < /dev/null
+  fi
+}
+
+is_err() {
+  case $1 in
+    "(error)"*|"ERR "*|"NOPERM"*|"NOAUTH"*|"WRONGPASS"*|"LOADING"*|"MASTERDOWN"*|\
+    "Could not connect"*|"Error:"*|"Unrecognized option"*|"AUTH failed"*|"Warning: AUTH"*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# run_cmd OUTFILE HOST PORT ARGS... ; on error the output is kept as OUTFILE.err
+run_cmd() {
+  local out=$1 h=$2 p=$3; shift 3
+  local rc=0 first=""
+  cli "$h" "$p" "$@" > "$out" 2>&1 || rc=$?
+  IFS= read -r first < "$out" || true
+  first=${first%$'\r'}
+  if (( rc != 0 )) || is_err "$first"; then
+    mv -f "$out" "$out.err"
+    return 1
+  fi
+  return 0
+}
+
+info_get() { # FILE KEY
+  awk -F: -v k="$2" '$1==k { sub(/\r$/,""); sub(/^[^:]*:/,""); print; exit }' "$1" 2>/dev/null
+}
+
+# Parse valkey-cli --no-raw (TTY formatted) nested replies into
+# "path<TAB>value" records, e.g. "3.4.1<TAB>GET".
+tty_parse() {
+  awk '
+    function strip(v) {
+      if (v ~ /^\(integer\) /) return substr(v, 11)
+      if (v ~ /^\(double\) /)  return substr(v, 10)
+      if (v ~ /^".*"$/)       return substr(v, 2, length(v) - 2)
+      return v
+    }
+    {
+      sub(/\r$/, ""); line = $0; col = 0
+      while (match(line, /^ *[0-9]+\) /)) {
+        tok = substr(line, 1, RLENGTH); endc = col + RLENGTH
+        num = tok; gsub(/[ )]/, "", num)
+        d = 0
+        for (i = 1; i <= depth; i++) if (ends[i] == endc) { d = i; break }
+        if (!d) { depth++; ends[depth] = endc; d = depth } else depth = d
+        idx[d] = num
+        col = endc; line = substr(line, RLENGTH + 1)
+      }
+      if (depth == 0) next
+      path = idx[1]; for (i = 2; i <= depth; i++) path = path "." idx[i]
+      print path "\t" strip(line)
+    }' "$1"
+}
+
+# ------------------------------------------------------------- collection ---
+collect_node() { # HOST PORT DIR
+  local h=$1 p=$2 d=$3 out
+  mkdir -p "$d" || die "cannot create $d"
+  out=$(cli "$h" "$p" PING 2>&1); out=${out%$'\r'}
+  if [[ $out != PONG ]]; then
+    rm -rf "$d"
+    LAST_ERR=$(printf '%s' "$out" | tr '\n\t' '  ' | cut -c1-200)
+    [[ -z $LAST_ERR ]] && LAST_ERR="no reply"
+    return 1
+  fi
+  date +%s > "$d/collected_at"
+
+  run_cmd "$d/info.txt" "$h" "$p" INFO everything
+  if ! grep -q '^# Server' "$d/info.txt" 2>/dev/null; then
+    { run_cmd "$d/info.txt" "$h" "$p" INFO all || run_cmd "$d/info.txt" "$h" "$p" INFO; } && rm -f "$d/info.txt.err"
+  fi
+
+  if run_cmd "$d/config.raw" "$h" "$p" CONFIG GET '*'; then
+    awk 'NR % 2 == 1 { sub(/\r$/, ""); k = $0; next }
+         { sub(/\r$/, ""); v = $0
+           if (k ~ /^(requirepass|masterauth|tls-key-file-pass|tls-client-key-file-pass)$/ && v != "")
+             v = "<redacted>"
+           print k "\t" v }' "$d/config.raw" > "$d/config.txt"
+  fi
+  rm -f "$d/config.raw"
+
+  if grep -q '^cluster_enabled:1' "$d/info.txt" 2>/dev/null; then
+    run_cmd "$d/cluster_info.txt"  "$h" "$p" CLUSTER INFO
+    run_cmd "$d/cluster_nodes.txt" "$h" "$p" CLUSTER NODES
+  fi
+
+  run_cmd "$d/slowlog_len.txt"    "$h" "$p" SLOWLOG LEN
+  run_cmd "$d/slowlog.txt"        "$h" "$p" --no-raw SLOWLOG GET "$SLOWLOG_N"
+  run_cmd "$d/latency_latest.txt" "$h" "$p" --no-raw LATENCY LATEST
+  run_cmd "$d/latency_doctor.txt" "$h" "$p" LATENCY DOCTOR
+  run_cmd "$d/memory_doctor.txt"  "$h" "$p" MEMORY DOCTOR
+  run_cmd "$d/memory_stats.txt"   "$h" "$p" --no-raw MEMORY STATS
+  run_cmd "$d/module_list.txt"    "$h" "$p" --no-raw MODULE LIST
+  # Valkey 8.1+: large request / large reply logs (ignored when unsupported)
+  run_cmd "$d/commandlog_large_request.txt" "$h" "$p" --no-raw COMMANDLOG GET 32 large-request ||
+    rm -f "$d/commandlog_large_request.txt.err"
+  run_cmd "$d/commandlog_large_reply.txt" "$h" "$p" --no-raw COMMANDLOG GET 32 large-reply ||
+    rm -f "$d/commandlog_large_reply.txt.err"
+  (( CLIENT_LIST )) && run_cmd "$d/client_list.txt" "$h" "$p" CLIENT LIST
+
+  if run_cmd "$d/acl.raw" "$h" "$p" ACL LIST; then
+    sed -E 's/#[0-9a-fA-F]+/#<redacted>/g; s/ >[^ ]+/ ><redacted>/g' "$d/acl.raw" > "$d/acl.txt"
+  fi
+  rm -f "$d/acl.raw"
+
+  if (( BIGKEYS )) && grep -q '^role:master' "$d/info.txt" 2>/dev/null; then
+    log "  running --bigkeys / --memkeys on $h:$p (SCAN of the keyspace)"
+    cli "$h" "$p" --bigkeys -i 0.01 > "$d/bigkeys.txt" 2>&1 || true
+    cli "$h" "$p" --memkeys -i 0.01 > "$d/memkeys.txt" 2>&1 || true
+  fi
+
+  # Same host: process limits, swap usage and disk space of the data directory.
+  local pid cmdl dir
+  pid=$(info_get "$d/info.txt" process_id)
+  if [[ -n $pid && -r /proc/$pid/cmdline ]]; then
+    cmdl=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    if [[ $cmdl =~ (valkey|redis) && $cmdl == *":$p"* ]]; then
+      LOCAL_FOUND=1
+      printf '%s\n' "$cmdl" > "$d/proc_cmdline.txt"
+      cat "/proc/$pid/limits" > "$d/proc_limits.txt" 2>/dev/null
+      cat "/proc/$pid/status" > "$d/proc_status.txt" 2>/dev/null
+      dir=$(awk -F'\t' '$1=="dir"{print $2; exit}' "$d/config.txt" 2>/dev/null)
+      [[ -n $dir && -d $dir ]] && df -P "$dir" > "$d/df_dir.txt" 2>/dev/null
+    fi
+  fi
+  return 0
+}
+
+discover_from() { # DIR -> "host:port|nodeid" lines
+  local d=$1
+  if [[ -s $d/cluster_nodes.txt ]]; then
+    awk '{ sub(/\r$/, "")
+           if ($3 ~ /myself|noaddr|handshake/) next
+           a = $2; sub(/[@,].*/, "", a)
+           if (a ~ /^:/ || a ~ /:0$/) next
+           print a "|" $1 }' "$d/cluster_nodes.txt"
+    return
+  fi
+  awk -F: '{ sub(/\r$/, "") }
+    $1 ~ /^slave[0-9]+$/ {
+      n = split($2, a, ","); ip = ""; port = ""
+      for (i = 1; i <= n; i++) { split(a[i], b, "="); if (b[1] == "ip") ip = b[2]; if (b[1] == "port") port = b[2] }
+      if (ip != "" && port != "") print ip ":" port "|"
+    }
+    $1 == "master_host" { mh = $2 }
+    $1 == "master_port" { mp = $2 }
+    END { if (mh != "" && mp != "") print mh ":" mp "|" }' "$d/info.txt"
+}
+
+collect_os() {
+  local d="$OUTDIR/os" f v
+  mkdir -p "$d"
+  {
+    echo "hostname=$(hostname 2>/dev/null)"
+    echo "os=$( ( . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" ) || uname -s)"
+    echo "kernel=$(uname -r 2>/dev/null)"
+    echo "arch=$(uname -m 2>/dev/null)"
+    echo "cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)"
+    echo "cpu_model=$(awk -F: '/model name/ { sub(/^ +/, "", $2); print $2; exit }' /proc/cpuinfo 2>/dev/null)"
+    awk '/^(MemTotal|MemAvailable|SwapTotal|SwapFree):/ { print tolower($1) "=" $2 }' /proc/meminfo 2>/dev/null | tr -d ':'
+    echo "thp_enabled=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)"
+    echo "thp_defrag=$(cat /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null)"
+    for f in vm/overcommit_memory vm/swappiness vm/max_map_count net/core/somaxconn \
+             net/ipv4/tcp_max_syn_backlog fs/file-max net/ipv4/tcp_keepalive_time; do
+      v=$(cat "/proc/sys/$f" 2>/dev/null)
+      echo "${f//\//.}=$v"
+    done
+    echo "loadavg=$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+    echo "uptime_sec=$(cut -d. -f1 /proc/uptime 2>/dev/null)"
+    echo "numa_nodes=$(ls -d /sys/devices/system/node/node[0-9]* 2>/dev/null | wc -l)"
+    if [[ -f /.dockerenv ]] || grep -qE 'docker|kubepods|containerd' /proc/1/cgroup 2>/dev/null; then
+      echo "container=yes"
+    else
+      echo "container=no"
+    fi
+    if [[ -r /sys/fs/cgroup/memory.max ]]; then
+      echo "cgroup_memory_limit=$(cat /sys/fs/cgroup/memory.max)"
+    elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+      echo "cgroup_memory_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"
+    fi
+  } > "$d/os.txt" 2>/dev/null
+  df -hP > "$d/df.txt" 2>/dev/null
+  free -m > "$d/free.txt" 2>/dev/null
+  ps -eo pid,user,rss,vsz,pcpu,etime,args 2>/dev/null | awk 'NR == 1 || /valkey|redis/' | grep -v awk > "$d/ps.txt"
+}
+
+collect_all() {
+  mkdir -p "$OUTDIR/nodes" || die "cannot create output directory $OUTDIR"
+  : > "$OUTDIR/nodes.txt"
+  local auth_used=0; [[ -n $PASSWORD || -n $ACL_USER ]] && auth_used=1
+  {
+    echo "tool=$TOOL"
+    echo "tool_version=$VERSION"
+    echo "collected_at=$(date '+%Y-%m-%d %H:%M:%S UTC')"
+    echo "collected_epoch=$(date +%s)"
+    echo "collector_host=$(hostname 2>/dev/null)"
+    echo "seed=$HOST:$PORT"
+    echo "cli=$CLI"
+    echo "cli_version=$("$CLI" --version 2>/dev/null | head -1)"
+    echo "auth_used=$auth_used"
+    echo "acl_user=$ACL_USER"
+    echo "tls=$TLS"
+    echo "discover=$DISCOVER"
+  } > "$OUTDIR/meta.txt"
+
+  local -a queue=()
+  local -A seen_addr=() seen_run=() seen_id=()
+  if [[ -n $NODES_OPT ]]; then
+    IFS=, read -ra queue <<< "$NODES_OPT"
+    DISCOVER=0
+  else
+    queue=("$HOST:$PORT|")
+  fi
+
+  local i=0 item addr id h p dname d rid myid a ok=0
+  while (( i < ${#queue[@]} )); do
+    item=${queue[i]}; ((i++))
+    addr=${item%%|*}; id=""; [[ $item == *"|"* ]] && id=${item#*|}
+    addr=${addr// /}
+    [[ -z $addr ]] && continue
+    [[ $addr == *:* ]] || addr="$addr:6379"
+    [[ -n ${seen_addr[$addr]:-} ]] && continue
+    [[ -n $id && -n ${seen_id[$id]:-} ]] && continue
+    seen_addr[$addr]=1
+    if (( ok >= MAX_NODES )); then warn "--max-nodes $MAX_NODES reached, remaining nodes skipped"; break; fi
+    h=${addr%:*}; p=${addr##*:}
+    dname="${h//[^A-Za-z0-9._-]/_}_$p"
+    d="$OUTDIR/nodes/$dname"
+    log "Collecting $h:$p"
+    if ! collect_node "$h" "$p" "$d"; then
+      log "  unreachable: $LAST_ERR"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$h" "$p" "$dname" "unreachable" "$LAST_ERR" >> "$OUTDIR/nodes.txt"
+      continue
+    fi
+    rid=$(info_get "$d/info.txt" run_id)
+    if [[ -n $rid && -n ${seen_run[$rid]:-} ]]; then
+      log "  same instance as ${seen_run[$rid]}, skipped"
+      rm -rf "$d"
+      continue
+    fi
+    [[ -n $rid ]] && seen_run[$rid]="$h:$p"
+    myid=""
+    [[ -s $d/cluster_nodes.txt ]] && myid=$(awk '$3 ~ /myself/ { print $1; exit }' "$d/cluster_nodes.txt")
+    [[ -n $myid ]] && seen_id[$myid]=1
+    printf '%s\t%s\t%s\t%s\t%s\n' "$h" "$p" "$dname" "ok" "" >> "$OUTDIR/nodes.txt"
+    ((ok++))
+    if (( DISCOVER )); then
+      while IFS= read -r a; do
+        [[ -n $a ]] && queue+=("$a")
+      done < <(discover_from "$d")
+    fi
+  done
+
+  (( ok > 0 )) || die "could not collect any node (last error: $LAST_ERR)"
+  if [[ $OS_MODE == on ]] || [[ $OS_MODE == auto && $LOCAL_FOUND == 1 ]]; then
+    log "Collecting local OS information"
+    collect_os
+  fi
+}
+
+# --------------------------------------------------------------- analysis ---
+declare -A I=() C=() M=() OSV=()
+declare -A N_DIR=() N_ROLE=() N_PRODUCT=() N_VER=() N_UP=() N_USED=() N_MAX=() N_FRAG=()
+declare -A N_KEYS=() N_OPS=() N_CLIENTS=() N_HIT=() N_PERSIST=() N_FORK=() N_ID=() N_HOST=()
+declare -A N_CSTATE=() N_KNOWN=() N_SYSMEM=() N_MEMPCT=() N_LINK=() N_MASTER=() N_SLAVES=()
+declare -A ID2LAB=() CFGALL=() CFGKEYS=()
+NODES=(); UNREACHABLE=(); IS_CLUSTER=0; RPT=""; FINDINGS=""
+
+addg() { # SEV NODE AREA TITLE DETAIL RECO
+  local a=("$@") i
+  for i in 0 1 2 3 4 5; do a[i]=${a[i]//$'\t'/ }; a[i]=${a[i]//$'\n'/ }; done
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${a[0]}" "${a[1]}" "${a[2]}" "${a[3]}" "${a[4]}" "${a[5]}" >> "$FINDINGS"
+}
+add() { addg "$1" "$n" "$2" "$3" "$4" "$5"; }   # uses $n of the caller
+
+load_node() {
+  local d=$1 l k v
+  I=(); C=()
+  if [[ -f $d/info.txt ]]; then
+    while IFS= read -r l || [[ -n $l ]]; do
+      l=${l%$'\r'}
+      [[ -z $l || $l == '#'* || $l != *:* ]] && continue
+      I[${l%%:*}]=${l#*:}
+    done < "$d/info.txt"
+  fi
+  if [[ -f $d/config.txt ]]; then
+    while IFS=$'\t' read -r k v || [[ -n $k ]]; do
+      [[ -n $k ]] && C[$k]=$v
+    done < "$d/config.txt"
+  fi
+}
+
+# Summaries of CLIENT LIST: "S<TAB>key<TAB>value" and "IP|NAME|CMD|USER<TAB>x<TAB>count"
+client_summary() {
+  awk '{
+      sub(/\r$/, ""); delete f
+      for (i = 1; i <= NF; i++) { p = index($i, "="); if (p) f[substr($i, 1, p - 1)] = substr($i, p + 1) }
+      total++
+      ip = f["addr"]; sub(/:[0-9]+$/, "", ip); byip[ip]++
+      nm = f["name"]; if (nm == "") nm = "(no name)"; byname[nm]++
+      cm = f["cmd"]; if (cm == "") cm = "(none)"; bycmd[cm]++
+      us = f["user"]; if (us == "") us = "default"; byuser[us]++
+      if (f["idle"] + 0 > 3600) idle1h++
+      if (f["idle"] + 0 > 86400) idle1d++
+      if (f["flags"] ~ /O/) monitor++
+      if (f["flags"] ~ /S/) replica++
+      if (f["sub"] + 0 > 0 || f["psub"] + 0 > 0 || f["ssub"] + 0 > 0) pubsub++
+      om = f["omem"] + 0
+      if (om > maxomem) { maxomem = om; maxomem_c = f["addr"] " name=" f["name"] " cmd=" f["cmd"] }
+      q = f["qbuf"] + 0
+      if (q > maxqbuf) { maxqbuf = q; maxqbuf_c = f["addr"] " name=" f["name"] " cmd=" f["cmd"] }
+      if (om > 33554432) bigomem++
+    }
+    END {
+      printf "S\ttotal\t%d\nS\tidle1h\t%d\nS\tidle1d\t%d\nS\tmonitor\t%d\nS\treplica\t%d\nS\tpubsub\t%d\n", total, idle1h, idle1d, monitor, replica, pubsub
+      printf "S\tmaxomem\t%.0f\nS\tmaxomem_c\t%s\nS\tmaxqbuf\t%.0f\nS\tmaxqbuf_c\t%s\nS\tbigomem\t%d\n", maxomem, maxomem_c, maxqbuf, maxqbuf_c, bigomem
+      for (k in byip)   print "IP\t" k "\t" byip[k]
+      for (k in byname) print "NAME\t" k "\t" byname[k]
+      for (k in bycmd)  print "CMD\t" k "\t" bycmd[k]
+      for (k in byuser) print "USER\t" k "\t" byuser[k]
+    }' "$1"
+}
+
+top_of() { # RAWFILE TYPE HEADER
+  printf '%s\tConnections\n' "$3"
+  awk -F'\t' -v t="$2" '$1 == t { print $2 "\t" $3 }' "$1" | sort -t$'\t' -k2,2nr | head -15
+}
+
+gen_node() { # LABEL DNAME
+  local n=$1 dn=$2
+  local d="$OUTDIR/nodes/$dn" r="$RPT/nodes/$dn"
+  mkdir -p "$r"
+  load_node "$d"
+
+  local role=${I[role]:-unknown}
+  local product ver vi
+  if [[ -n ${I[valkey_version]:-} ]]; then product="Valkey"; ver=${I[valkey_version]}
+  elif [[ ${I[server_name]:-} == valkey ]]; then product="Valkey"; ver=${I[redis_version]:-?}
+  else product="Redis"; ver=${I[redis_version]:-?}; fi
+  verint vi "$ver"
+  local now=${M[collected_epoch]:-0}; [[ -f $d/collected_at ]] && now=$(<"$d/collected_at")
+  local uptime=${I[uptime_in_seconds]:-0}
+  local cluster=0; [[ ${I[cluster_enabled]:-0} == 1 ]] && cluster=1
+  local have_cfg=0; (( ${#C[@]} > 0 )) && have_cfg=1
+
+  local used=${I[used_memory]:-0} rss=${I[used_memory_rss]:-0} peak=${I[used_memory_peak]:-0}
+  local maxmem=${I[maxmemory]:-${C[maxmemory]:-0}} sysmem=${I[total_system_memory]:-0}
+  isnum "$maxmem" || maxmem=0; isnum "$used" || used=0; isnum "$rss" || rss=0; isnum "$sysmem" || sysmem=0
+  local policy=${I[maxmemory_policy]:-${C[maxmemory-policy]:-}}
+  local mempct=-1; (( maxmem > 0 )) && mempct=$(( used * 100 / maxmem ))
+  local frag afrag; f100 frag "${I[mem_fragmentation_ratio]:-0}"; f100 afrag "${I[allocator_frag_ratio]:-0}"
+
+  local keys=0 expires=0 dbs=0 k kk ee tt
+  for k in "${!I[@]}"; do
+    [[ $k =~ ^db[0-9]+$ ]] || continue
+    kv kk "${I[$k]}" keys; kv ee "${I[$k]}" expires
+    keys=$(( keys + ${kk:-0} )); expires=$(( expires + ${ee:-0} )); ((dbs++))
+  done
+
+  local ops=${I[instantaneous_ops_per_sec]:-0}
+  local cc=${I[connected_clients]:-0} maxclients=${C[maxclients]:-${I[maxclients]:-10000}}
+  local hits=${I[keyspace_hits]:-0} misses=${I[keyspace_misses]:-0} hitr=-1
+  (( hits + misses > 0 )) && hitr=$(( hits * 1000 / (hits + misses) ))
+  local myid=""; [[ -s $d/cluster_nodes.txt ]] && myid=$(awk '$3 ~ /myself/ { print $1; exit }' "$d/cluster_nodes.txt")
+  local aof=${I[aof_enabled]:-0} save=${C[save]-?}
+  local persist=""
+  [[ $save != "" && $save != "?" ]] && persist="rdb"
+  [[ $save == "?" ]] && persist="?"
+  (( aof == 1 )) && persist="${persist:+$persist+}aof"
+  [[ -z $persist ]] && persist="none"
+  local forkms=$(( ${I[latest_fork_usec]:-0} / 1000 ))
+  local cpu_pct
+  cpu_pct=$(awk -v s="${I[used_cpu_sys_main_thread]:-${I[used_cpu_sys]:-0}}" \
+                -v u="${I[used_cpu_user_main_thread]:-${I[used_cpu_user]:-0}}" -v up="$uptime" \
+                'BEGIN { if (up > 0) printf "%.1f", (s + u) * 100 / up; else print "0.0" }')
+
+  # Client list summary
+  local -A CL=()
+  if [[ -s $d/client_list.txt ]]; then
+    client_summary "$d/client_list.txt" > "$r/clients.raw"
+    while IFS=$'\t' read -r t k kk; do [[ $t == S ]] && CL[$k]=$kk; done < "$r/clients.raw"
+    top_of "$r/clients.raw" IP   "Client address" > "$r/client_ips.tsv"
+    top_of "$r/clients.raw" NAME "Client name"    > "$r/client_names.tsv"
+    top_of "$r/clients.raw" CMD  "Last command"   > "$r/client_cmds.tsv"
+    top_of "$r/clients.raw" USER "ACL user"       > "$r/client_users.tsv"
+  fi
+
+  # Remember per node values for overview and cluster checks.
+  N_ROLE[$n]=$role; N_PRODUCT[$n]=$product; N_VER[$n]=$ver; N_UP[$n]=$uptime
+  N_USED[$n]=$used; N_MAX[$n]=$maxmem; N_FRAG[$n]=${I[mem_fragmentation_ratio]:-}
+  N_KEYS[$n]=$keys; N_OPS[$n]=$ops; N_CLIENTS[$n]=$cc; N_HIT[$n]=$hitr; N_PERSIST[$n]=$persist
+  N_FORK[$n]=$forkms; N_ID[$n]=$myid; N_SYSMEM[$n]=$sysmem; N_MEMPCT[$n]=$mempct
+  N_LINK[$n]=${I[master_link_status]:-}; N_MASTER[$n]="${I[master_host]:-}:${I[master_port]:-}"
+  N_SLAVES[$n]=${I[connected_slaves]:-0}
+  [[ -n $myid ]] && ID2LAB[$myid]=$n
+  for k in "${!C[@]}"; do CFGALL["$n|$k"]=${C[$k]}; CFGKEYS[$k]=1; done
+  if [[ -f $d/cluster_info.txt ]]; then
+    N_CSTATE[$n]=$(info_get "$d/cluster_info.txt" cluster_state)
+    N_KNOWN[$n]=$(info_get "$d/cluster_info.txt" cluster_known_nodes)
+  fi
+
+  write_node_sections
+  check_node
+}
+
+# ---- sections (label<TAB>value; a value may start with !c! !w! !o! for colour)
+write_node_sections() {
+  local x
+  {
+    kvp "Product" "$product $ver"
+    [[ -n ${I[redis_git_sha1]:-} && ${I[redis_git_sha1]} != 00000000 ]] && kvp "Git SHA1" "${I[redis_git_sha1]}"
+    kvp "Mode" "${I[server_mode]:-${I[redis_mode]:-?}}"
+    kvp "Role" "$role"
+    kvp "OS" "${I[os]:-?} (${I[arch_bits]:-?} bit)"
+    kvp "Process ID" "${I[process_id]:-?}"
+    kvp "Executable" "${I[executable]:-?}"
+    kvp "Config file" "${I[config_file]:-(none)}"
+    kvp "TCP port" "${I[tcp_port]:-?}"
+    x=$(hdur "$uptime"); (( uptime < 86400 )) && x="!w!$x"
+    kvp "Uptime" "$x"
+    kvp "Started" "$(tsd $(( now - uptime )))"
+    kvp "Run ID" "${I[run_id]:-?}"
+    kvp "Event loop" "${I[multiplexing_api]:-?}, io-threads ${C[io-threads]:-${I[io_threads_active]:-?}}"
+    kvp "Allocator" "${I[mem_allocator]:-?}"
+    kvp "hz / configured" "${I[hz]:-?} / ${I[configured_hz]:-?}"
+    kvp "Main thread CPU" "${cpu_pct}% average since start"
+    [[ -n $myid ]] && kvp "Cluster node ID" "$myid"
+  } > "$r/server.kv"
+
+  {
+    kvp "Used memory" "${I[used_memory_human]:-$(hb "$used")}"
+    kvp "Used memory RSS" "${I[used_memory_rss_human]:-$(hb "$rss")}"
+    kvp "Peak memory" "${I[used_memory_peak_human]:-$(hb "$peak")} (${I[used_memory_peak_perc]:-?} of peak in use)"
+    if (( maxmem > 0 )); then
+      x="$(hb "$maxmem")"
+      if (( mempct >= 90 )); then x="!c!$x ($mempct% used)"; elif (( mempct >= 80 )); then x="!w!$x ($mempct% used)"; else x="$x ($mempct% used)"; fi
+    else
+      x="!w!0 (no limit)"
+    fi
+    kvp "maxmemory" "$x"
+    kvp "maxmemory-policy" "${policy:-?}"
+    kvp "System memory" "${I[total_system_memory_human]:-?}"
+    x=${I[mem_fragmentation_ratio]:-?}; (( frag >= 150 && rss > 104857600 )) && x="!w!$x"
+    (( frag > 0 && frag < 100 && used > 104857600 )) && x="!c!$x"
+    kvp "Fragmentation ratio" "$x (allocator ${I[allocator_frag_ratio]:-?})"
+    kvp "Dataset" "$(hb "${I[used_memory_dataset]:-0}") (${I[used_memory_dataset_perc]:-?})"
+    kvp "Overhead" "$(hb "${I[used_memory_overhead]:-0}")"
+    kvp "Startup" "$(hb "${I[used_memory_startup]:-0}")"
+    kvp "Client buffers" "normal $(hb "${I[mem_clients_normal]:-0}"), replicas $(hb "${I[mem_clients_slaves]:-0}")"
+    kvp "Replication backlog" "$(hb "${I[mem_replication_backlog]:-0}")"
+    kvp "Lua / scripts" "$(hb "${I[used_memory_lua]:-${I[used_memory_vm_eval]:-0}}") / $(hb "${I[used_memory_scripts]:-${I[used_memory_scripts_eval]:-0}}"), ${I[number_of_cached_scripts]:-0} cached scripts"
+    kvp "Active defrag" "${C[activedefrag]:-?} (running: ${I[active_defrag_running]:-0})"
+    kvp "Lazyfree pending" "${I[lazyfree_pending_objects]:-0}"
+  } > "$r/memory.kv"
+
+  {
+    kvp "Loading" "${I[loading]:-0}"
+    kvp "save" "${save:-(disabled)}"
+    x=${I[rdb_last_bgsave_status]:-?}; [[ $x != ok ]] && x="!c!$x"
+    kvp "Last bgsave status" "$x"
+    if isnum "${I[rdb_last_save_time]:-}"; then
+      kvp "Last save" "$(tsd "${I[rdb_last_save_time]}") ($(hdur $(( now - ${I[rdb_last_save_time]} ))) ago)"
+    fi
+    kvp "Changes since save" "$(commas "${I[rdb_changes_since_last_save]:-0}")"
+    kvp "Last bgsave duration" "${I[rdb_last_bgsave_time_sec]:--1} s"
+    kvp "AOF enabled" "$aof (appendfsync ${C[appendfsync]:-?})"
+    if (( aof == 1 )); then
+      x=${I[aof_last_write_status]:-?}; [[ $x != ok ]] && x="!c!$x"; kvp "AOF last write" "$x"
+      x=${I[aof_last_bgrewrite_status]:-?}; [[ $x != ok ]] && x="!c!$x"; kvp "AOF last rewrite" "$x"
+      kvp "AOF size" "$(hb "${I[aof_current_size]:-0}") (base $(hb "${I[aof_base_size]:-0}"))"
+      x=${I[aof_delayed_fsync]:-0}; (( x > 0 )) && x="!w!$x"; kvp "AOF delayed fsync" "$x"
+    fi
+    x="$forkms ms"; (( forkms >= 1000 )) && x="!w!$x"; kvp "Latest fork" "$x"
+    kvp "Data dir" "${C[dir]:-?} (${C[dbfilename]:-?})"
+  } > "$r/persistence.kv"
+
+  {
+    kvp "Role" "$role"
+    if [[ $role == master ]]; then
+      kvp "Connected replicas" "${I[connected_slaves]:-0}"
+    else
+      kvp "Primary" "${I[master_host]:-?}:${I[master_port]:-?}"
+      x=${I[master_link_status]:-?}; [[ $x != up ]] && x="!c!$x"
+      kvp "Link status" "$x"
+      kvp "Last I/O" "${I[master_last_io_seconds_ago]:-?} s ago"
+      kvp "Sync in progress" "${I[master_sync_in_progress]:-0}"
+      kvp "Replica offset" "${I[slave_repl_offset]:-?}"
+      kvp "Read only" "${I[slave_read_only]:-${C[replica-read-only]:-?}}"
+    fi
+    kvp "Replication ID" "${I[master_replid]:-?}"
+    kvp "Repl offset" "${I[master_repl_offset]:-?}"
+    kvp "Backlog size" "$(hb "${I[repl_backlog_size]:-0}") (active ${I[repl_backlog_active]:-0})"
+    kvp "Full / partial syncs" "${I[sync_full]:-0} / ${I[sync_partial_ok]:-0} ok, ${I[sync_partial_err]:-0} failed"
+    kvp "Diskless sync" "${C[repl-diskless-sync]:-?}"
+  } > "$r/replication.kv"
+
+  {
+    printf 'Replica\tState\tOffset\tLag (s)\n'
+    for k in "${!I[@]}"; do
+      [[ $k =~ ^slave[0-9]+$ ]] || continue
+      local ip pt st of lg
+      kv ip "${I[$k]}" ip; kv pt "${I[$k]}" port; kv st "${I[$k]}" state; kv of "${I[$k]}" offset; kv lg "${I[$k]}" lag
+      [[ $st != online ]] && st="!c!$st"
+      (( ${lg:-0} > 10 )) && lg="!w!$lg"
+      printf '%s\t%s\t%s\t%s\n' "$ip:$pt" "$st" "$of" "$lg"
+    done | sort
+  } > "$r/replicas.tsv"
+
+  {
+    x="$(commas "$cc") / $(commas "$maxclients")"
+    if isnum "$maxclients" && (( maxclients > 0 )); then
+      (( cc * 100 / maxclients >= 80 )) && x="!w!$x"
+    fi
+    kvp "Connected / maxclients" "$x"
+    kvp "Blocked clients" "${I[blocked_clients]:-0}"
+    kvp "Tracking clients" "${I[tracking_clients]:-0}"
+    x=${I[rejected_connections]:-0}; (( x > 0 )) && x="!w!$x"
+    kvp "Rejected connections" "$x"
+    local cps=0; (( uptime > 0 )) && cps=$(( ${I[total_connections_received]:-0} / uptime ))
+    kvp "Connections received" "$(commas "${I[total_connections_received]:-0}") (~$cps/s)"
+    kvp "Max input buffer" "$(hb "${I[client_recent_max_input_buffer]:-0}")"
+    kvp "Max output buffer" "$(hb "${I[client_recent_max_output_buffer]:-0}")"
+    kvp "timeout / tcp-keepalive" "${C[timeout]:-?} / ${C[tcp-keepalive]:-?}"
+    if [[ -n ${CL[total]:-} ]]; then
+      kvp "Idle > 1h / > 1d" "${CL[idle1h]} / ${CL[idle1d]}"
+      kvp "Pub/Sub clients" "${CL[pubsub]}"
+      x=${CL[monitor]}; (( x > 0 )) && x="!w!$x"; kvp "MONITOR clients" "$x"
+      kvp "Largest output buffer" "$(hb "${CL[maxomem]}") ${CL[maxomem_c]}"
+      kvp "Largest query buffer" "$(hb "${CL[maxqbuf]}") ${CL[maxqbuf_c]}"
+    fi
+  } > "$r/clients.kv"
+
+  {
+    kvp "Ops/sec (now)" "$(commas "$ops")"
+    local avgops=0; (( uptime > 0 )) && avgops=$(( ${I[total_commands_processed]:-0} / uptime ))
+    kvp "Commands processed" "$(commas "${I[total_commands_processed]:-0}") (~$(commas "$avgops")/s avg)"
+    if (( hitr >= 0 )); then
+      x="$(( hitr / 10 )).$(( hitr % 10 ))%"
+      (( hits + misses > 100000 && hitr < 800 )) && x="!w!$x"
+      kvp "Keyspace hit ratio" "$x ($(commas "$hits") hits, $(commas "$misses") misses)"
+    fi
+    kvp "Expired keys" "$(commas "${I[expired_keys]:-0}") (stale ${I[expired_stale_perc]:-?}%)"
+    x=$(commas "${I[evicted_keys]:-0}"); (( ${I[evicted_keys]:-0} > 0 )) && x="!w!$x"
+    kvp "Evicted keys" "$x"
+    kvp "Network in / out" "$(hb "${I[total_net_input_bytes]:-0}") / $(hb "${I[total_net_output_bytes]:-0}") (now ${I[instantaneous_input_kbps]:-?} / ${I[instantaneous_output_kbps]:-?} KB/s)"
+    kvp "Error replies" "$(commas "${I[total_error_replies]:-0}")"
+    kvp "Pub/Sub channels / patterns" "${I[pubsub_channels]:-0} / ${I[pubsub_patterns]:-0}"
+    kvp "CPU sys / user" "${I[used_cpu_sys]:-?} / ${I[used_cpu_user]:-?} s"
+    kvp "I/O threaded reads / writes" "${I[io_threaded_reads_processed]:-0} / ${I[io_threaded_writes_processed]:-0}"
+  } > "$r/stats.kv"
+
+  {
+    printf 'DB\tKeys\tExpires\tExpires %%\tAvg TTL\n'
+    for k in "${!I[@]}"; do
+      [[ $k =~ ^db[0-9]+$ ]] || continue
+      kv kk "${I[$k]}" keys; kv ee "${I[$k]}" expires; kv tt "${I[$k]}" avg_ttl
+      local ep=0; (( ${kk:-0} > 0 )) && ep=$(( ${ee:-0} * 100 / kk ))
+      printf '%s\t%s\t%s\t%s%%\t%s\n' "$k" "$(commas "$kk")" "$(commas "$ee")" "$ep" "$(hdur $(( ${tt:-0} / 1000 )))"
+    done | sort -V 2>/dev/null
+  } > "$r/keyspace.tsv"
+
+  # Command statistics sorted by total time
+  {
+    printf 'Command\tCalls\tTotal ms\tus/call\t%% time\tRejected\tFailed\n'
+    awk -F: '/^cmdstat_/ {
+        sub(/\r$/, ""); name = substr($1, 9); n = split($2, a, ",")
+        calls = usec = upc = rej = fail = 0
+        for (i = 1; i <= n; i++) { split(a[i], b, "=")
+          if (b[1] == "calls") calls = b[2]; else if (b[1] == "usec") usec = b[2]
+          else if (b[1] == "usec_per_call") upc = b[2]; else if (b[1] == "rejected_calls") rej = b[2]
+          else if (b[1] == "failed_calls") fail = b[2] }
+        N++; nm[N] = name; c[N] = calls; u[N] = usec; p[N] = upc; r[N] = rej; f[N] = fail; tot += usec }
+      END { for (i = 1; i <= N; i++)
+        printf "%s\t%.0f\t%.1f\t%.2f\t%.1f\t%.0f\t%.0f\t%.0f\n", nm[i], c[i], u[i] / 1000, p[i], (tot > 0 ? u[i] * 100 / tot : 0), r[i], f[i], u[i] }' \
+      "$d/info.txt" | sort -t$'\t' -k8,8nr | head -30 | cut -f1-7
+  } > "$r/cmdstats.tsv"
+
+  {
+    printf 'Error\tCount\n'
+    awk -F: '/^errorstat_/ { sub(/\r$/, ""); e = substr($1, 11); c = $2; sub(/^count=/, "", c); print e "\t" c }' "$d/info.txt" |
+      sort -t$'\t' -k2,2nr
+  } > "$r/errorstats.tsv"
+
+  # Slow log
+  local slowraw="$r/slowlog.raw"
+  : > "$slowraw"
+  if [[ -s $d/slowlog.txt ]]; then
+    # Address of this tool as seen by the server: its own CLIENT LIST connection.
+    local self_ip=""
+    [[ -s $d/client_list.txt ]] && self_ip=$(awk '/cmd=client\|list/ { for (i = 1; i <= NF; i++) if ($i ~ /^addr=/) { a = substr($i, 6); sub(/:[0-9]+$/, "", a); print a; exit } }' "$d/client_list.txt")
+    # Entries produced by this tool's own collection commands are skipped.
+    tty_parse "$d/slowlog.txt" | awk -F'\t' -v sip="$self_ip" '
+      BEGIN { split("INFO EVERYTHING|INFO ALL|CONFIG GET|CLUSTER INFO|CLUSTER NODES|SLOWLOG LEN|SLOWLOG GET|LATENCY LATEST|LATENCY DOCTOR|MEMORY DOCTOR|MEMORY STATS|MODULE LIST|COMMANDLOG GET|CLIENT LIST|ACL LIST|PING", s, "|")
+              for (i in s) own[s[i]] = 1 }
+      function is_own(e,   w, ip) {
+        ip = cl[e]; sub(/:[0-9]+$/, "", ip)
+        if (sip != "" && ip != sip) return 0
+        split(toupper(args[e]), w, " "); return ((w[1] " " w[2]) in own || w[1] in own) }
+      { split($1, p, "."); e = p[1]; f = p[2]
+        if (!(e in seen)) { seen[e] = 1; order[++n] = e }
+        if (f == 1) id[e] = $2; else if (f == 2) ts[e] = $2; else if (f == 3) du[e] = $2
+        else if (f == 4) { a = $2; if (length(a) > 60) a = substr(a, 1, 57) "..."; args[e] = (args[e] == "" ? a : args[e] " " a) }
+        else if (f == 5) cl[e] = $2; else if (f == 6) nm[e] = $2 }
+      END { for (i = 1; i <= n; i++) { e = order[i]; if (is_own(e)) continue; a = args[e]; if (length(a) > 160) a = substr(a, 1, 157) "..."
+              printf "%s\t%s\t%s\t%s\t%s\t%s\n", id[e], ts[e], du[e] + 0, (a == "" ? "-" : a), (cl[e] == "" ? "-" : cl[e]), (nm[e] == "" ? "-" : nm[e]) } }' > "$slowraw"
+  fi
+  {
+    printf 'Time (UTC)\tDuration ms\tCommand\tClient\tName\n'
+    sort -t$'\t' -k3,3nr "$slowraw" | head -50 | while IFS=$'\t' read -r k tt x cmd cl nm; do
+      printf '%s\t%s\t%s\t%s\t%s\n' "$(tsd "$tt")" "$(awk -v v="$x" 'BEGIN { printf "%.1f", v / 1000 }')" "$cmd" "$cl" "$nm"
+    done
+  } > "$r/slowlog.tsv"
+  {
+    printf 'Command\tEntries\tMax ms\tAvg ms\n'
+    awk -F'\t' '{ c = toupper($4); sub(/ .*/, "", c); n[c]++; s[c] += $3; if ($3 > m[c]) m[c] = $3 }
+      END { for (c in n) printf "%s\t%d\t%.1f\t%.1f\n", c, n[c], m[c] / 1000, s[c] / n[c] / 1000 }' "$slowraw" |
+      sort -t$'\t' -k2,2nr
+  } > "$r/slowlog_summary.tsv"
+
+  {
+    printf 'Event\tTime (UTC)\tLatest ms\tMax ms\n'
+    if [[ -s $d/latency_latest.txt ]]; then
+      tty_parse "$d/latency_latest.txt" | awk -F'\t' '
+        { split($1, p, "."); e = p[1]; f = p[2]; if (!(e in s)) { s[e] = 1; o[++n] = e }; v[e, f] = $2 }
+        END { for (i = 1; i <= n; i++) { e = o[i]; print v[e, 1] "\t" v[e, 2] "\t" v[e, 3] "\t" v[e, 4] } }' |
+      while IFS=$'\t' read -r ev tt la mx; do printf '%s\t%s\t%s\t%s\n' "$ev" "$(tsd "$tt")" "$la" "$mx"; done
+    fi
+  } > "$r/latency.tsv"
+
+  {
+    printf 'Metric\tValue\n'
+    [[ -s $d/memory_stats.txt ]] && tty_parse "$d/memory_stats.txt" | awk -F'\t' '
+      index($1, ".") == 0 { if ($1 % 2 == 1) k = $2; else print k "\t" $2 }'
+  } > "$r/memory_stats.tsv"
+
+  if [[ -n $myid && -f $d/cluster_info.txt ]]; then
+    local -A CIN=()
+    while IFS=: read -r k x; do x=${x%$'\r'}; [[ -n $k ]] && CIN[$k]=$x; done < "$d/cluster_info.txt"
+    {
+      x=${CIN[cluster_state]:-?}; [[ $x != ok ]] && x="!c!$x"
+      kvp "Cluster state" "$x"
+      kvp "Slots assigned / ok" "${CIN[cluster_slots_assigned]:-?} / ${CIN[cluster_slots_ok]:-?}"
+      x="${CIN[cluster_slots_pfail]:-0} / ${CIN[cluster_slots_fail]:-0}"
+      [[ ${CIN[cluster_slots_pfail]:-0} != 0 || ${CIN[cluster_slots_fail]:-0} != 0 ]] && x="!c!$x"
+      kvp "Slots pfail / fail" "$x"
+      kvp "Known nodes / size" "${CIN[cluster_known_nodes]:-?} / ${CIN[cluster_size]:-?}"
+      kvp "Current / my epoch" "${CIN[cluster_current_epoch]:-?} / ${CIN[cluster_my_epoch]:-?}"
+      kvp "Bus messages sent / received" "$(commas "${CIN[cluster_stats_messages_sent]:-0}") / $(commas "${CIN[cluster_stats_messages_received]:-0}")"
+      kvp "cluster-node-timeout" "${C[cluster-node-timeout]:-?} ms"
+    } > "$r/cluster.kv"
+  fi
+}
+
+# ---- per node health checks (dynamic scope: uses locals of gen_node)
+check_node() {
+  local x y
+
+  # Access ---------------------------------------------------------------
+  (( have_cfg )) || add WARN "Access" "CONFIG GET not permitted" \
+    "Configuration could not be read (renamed, disabled or blocked by ACL); configuration checks were skipped." \
+    "Run the tool as a user allowed to run CONFIG GET, for example an ACL user with: +info +config|get +cluster|info +cluster|nodes +slowlog +latency +memory +client|list +acl|list +ping."
+
+  # Version ---------------------------------------------------------------
+  if [[ $product == Redis ]]; then
+    if (( vi < 60200 )); then
+      add CRIT "Version" "End-of-life Redis version" "Redis $ver is end-of-life and receives no bug or security fixes." \
+        "Upgrade. Valkey 8.x is a drop-in replacement for Redis OSS up to 7.2 (same RDB format, protocol and commands)."
+    elif (( vi < 70200 )); then
+      add WARN "Version" "Old Redis release line" "Redis $ver: check that this release line still receives security fixes." \
+        "Plan an upgrade to Valkey 8.x (drop-in replacement for Redis OSS 7.2) or a supported release."
+    else
+      add INFO "Version" "Running Redis" "Redis $ver." \
+        "Redis 7.4+ is no longer under the BSD license. Valkey 8.x is the open source (BSD) continuation of Redis OSS 7.2."
+    fi
+  elif (( vi > 0 && vi < 80000 )); then
+    add INFO "Version" "Valkey 7.x" "Valkey $ver." \
+      "Valkey 8.x adds the new multi-threaded I/O model, lower memory overhead per key and replication improvements. Plan an upgrade after testing."
+  fi
+  (( uptime > 0 && uptime < 86400 )) && add INFO "Server" "Recently restarted" \
+    "Uptime is $(hdur "$uptime"); counters (commandstats, hit ratio, evictions) cover a short period." \
+    "Check the server log for the restart reason (OOM kill, crash, maintenance) and re-run later for representative statistics."
+  [[ ${I[loading]:-0} == 1 ]] && add WARN "Server" "Dataset is loading" "The node is loading its RDB/AOF file." "Wait for loading to finish; re-run the report afterwards."
+
+  # Memory ----------------------------------------------------------------
+  if (( maxmem == 0 )); then
+    x=""; (( sysmem > 0 )) && x=" For this host ($(hb "$sysmem") RAM, single instance) that is about maxmemory $(hb $(( sysmem * 70 / 100 )))."
+    add WARN "Memory" "No maxmemory limit" \
+      "maxmemory=0: the dataset can grow until the OS OOM killer ends the process (used $(hb "$used"), system memory $(hb "$sysmem"))." \
+      "Set maxmemory to ~60-75% of the memory available to the instance, leaving headroom for fork copy-on-write, client and replication buffers and fragmentation.$x Pick maxmemory-policy for the workload (allkeys-lru/allkeys-lfu for caches, noeviction for data stores)."
+  else
+    if (( sysmem > 0 && maxmem > sysmem )); then
+      add CRIT "Memory" "maxmemory above physical RAM" "maxmemory $(hb "$maxmem") > system memory $(hb "$sysmem")." \
+        "Lower maxmemory below RAM (~60-75% of it) to avoid swapping or OOM kills."
+    elif (( sysmem > 0 && maxmem * 100 / sysmem > 85 )); then
+      add WARN "Memory" "maxmemory leaves little headroom" "maxmemory is $(( maxmem * 100 / sysmem ))% of system memory ($(hb "$maxmem") of $(hb "$sysmem"))." \
+        "Fork for BGSAVE/AOF rewrite/full sync can need extra memory (copy-on-write) plus buffers; keep maxmemory around 60-75% of RAM."
+    fi
+    if (( mempct >= 80 )); then
+      x="Writes keep working while keys are evicted."
+      [[ $policy == noeviction ]] && x="With maxmemory-policy noeviction, writes will fail with OOM errors once full."
+      [[ $policy == volatile-* ]] && x="With $policy only keys with a TTL can be evicted; writes fail with OOM if none are left."
+      y=WARN; (( mempct >= 90 )) && y=CRIT
+      add "$y" "Memory" "Memory usage close to maxmemory" "used $(hb "$used") of $(hb "$maxmem") ($mempct%), policy $policy. $x" \
+        "Add memory or shards, reduce the dataset (TTLs, smaller values, data structures) or review the eviction policy."
+    fi
+  fi
+  if [[ $policy == volatile-* ]] && (( keys > 1000 && expires * 100 / keys < 10 )); then
+    add WARN "Memory" "Volatile eviction policy but few keys have a TTL" \
+      "maxmemory-policy $policy, only $(commas "$expires") of $(commas "$keys") keys have a TTL." \
+      "Only keys with a TTL can be evicted. Use an allkeys-* policy for caches, or set TTLs on the keys."
+  fi
+  if (( ${I[evicted_keys]:-0} > 0 )); then
+    y=INFO; [[ $policy == volatile-* || $policy == noeviction ]] && y=WARN
+    add "$y" "Memory" "Keys are being evicted" "$(commas "${I[evicted_keys]}") keys evicted since start (policy $policy)." \
+      "Expected for a cache that runs at maxmemory. If the data must be kept, add memory or shards. Check the keyspace hit ratio to see if evictions hurt."
+  fi
+  if (( rss > 104857600 )); then
+    if (( frag >= 150 )); then
+      x="Enable active defragmentation: CONFIG SET activedefrag yes (jemalloc only), and tune active-defrag-threshold-lower / active-defrag-cycle-max. A controlled restart or failover also returns fragmented memory."
+      [[ ${C[activedefrag]:-} == yes ]] && x="activedefrag is already on; check active-defrag-cycle-max / thresholds, or restart via failover. Fragmentation often comes from many deletions or changing value sizes."
+      add WARN "Memory" "High memory fragmentation" \
+        "mem_fragmentation_ratio ${I[mem_fragmentation_ratio]} (RSS $(hb "$rss") vs used $(hb "$used")), allocator_frag_ratio ${I[allocator_frag_ratio]:-?}." "$x"
+    elif (( frag > 0 && frag < 100 && used > 104857600 )); then
+      add CRIT "Memory" "RSS lower than used memory (swapping)" \
+        "mem_fragmentation_ratio ${I[mem_fragmentation_ratio]}: RSS $(hb "$rss") < used $(hb "$used"); part of the dataset is probably in swap." \
+        "Check VmSwap of the process and the host's free memory. Ensure maxmemory fits in RAM, set vm.swappiness low (0-1) and avoid other memory consumers on the host."
+    fi
+  fi
+  x=${I[mem_clients_normal]:-0}
+  if isnum "$x" && (( x > 104857600 && used > 0 && x * 100 / used > 20 )); then
+    add WARN "Memory" "Client buffers use a lot of memory" "Client buffers use $(hb "$x") ($(( x * 100 / used ))% of used memory)." \
+      "Look for clients with large output buffers (big replies, slow pub/sub consumers) or query buffers. Consider maxmemory-clients (7.0+) and client-output-buffer-limit."
+  fi
+  x=${I[number_of_cached_scripts]:-0}
+  (( x > 1000 )) && add WARN "Memory" "Large Lua script cache" "$(commas "$x") cached scripts ($(hb "${I[used_memory_scripts]:-${I[used_memory_scripts_eval]:-0}}"))." \
+    "Scripts are probably generated with literal values inside. Pass values through KEYS/ARGV so one script is reused (EVALSHA), or use FUNCTION LOAD. SCRIPT FLUSH frees the cache."
+  x=""; kv x "${I[errorstat_OOM]:-}" count
+  (( ${x:-0} > 0 )) && add WARN "Memory" "OOM errors returned to clients" "$(commas "$x") commands were refused with OOM since start." \
+    "The node hit maxmemory and could not free memory (noeviction or no evictable keys). Add memory/shards or change maxmemory-policy."
+
+  # Persistence ----------------------------------------------------------
+  if [[ ${I[rdb_last_bgsave_status]:-ok} != ok ]]; then
+    add CRIT "Persistence" "Last RDB save failed" "rdb_last_bgsave_status=${I[rdb_last_bgsave_status]}; stop-writes-on-bgsave-error=${C[stop-writes-on-bgsave-error]:-?}." \
+      "Check the server log: disk full, permissions on dir, or fork failure (vm.overcommit_memory). With stop-writes-on-bgsave-error yes the node rejects writes until a save succeeds."
+  fi
+  if (( aof == 1 )); then
+    [[ ${I[aof_last_bgrewrite_status]:-ok} != ok ]] && add CRIT "Persistence" "Last AOF rewrite failed" \
+      "aof_last_bgrewrite_status=${I[aof_last_bgrewrite_status]}." "Check the server log for disk space, permissions or fork errors."
+    [[ ${I[aof_last_write_status]:-ok} != ok ]] && add CRIT "Persistence" "AOF write error" \
+      "aof_last_write_status=${I[aof_last_write_status]}." "Check disk space and I/O errors on the AOF directory; writes may be refused."
+    x=${I[aof_delayed_fsync]:-0}
+    (( x > 0 )) && add WARN "Persistence" "AOF fsync delayed (slow disk)" "aof_delayed_fsync=$x: fsync took longer than 2s." \
+      "The disk cannot keep up with appendfsync ${C[appendfsync]:-everysec}. Use faster storage, avoid sharing the disk, or consider no-appendfsync-on-rewrite yes."
+    [[ ${C[appendfsync]:-} == always ]] && add INFO "Persistence" "appendfsync always" "Every write waits for fsync." \
+      "appendfsync everysec loses at most ~1s of writes and is much faster. Keep always only if that loss is unacceptable."
+    [[ ${C[aof-use-rdb-preamble]:-yes} == no ]] && add INFO "Persistence" "AOF without RDB preamble" "aof-use-rdb-preamble no." \
+      "aof-use-rdb-preamble yes makes rewrites and restarts faster."
+  fi
+  if (( have_cfg )) && [[ $role == master && -z $save ]] && (( aof == 0 )); then
+    if (( ${I[connected_slaves]:-0} > 0 )); then
+      add WARN "Persistence" "Primary without persistence has replicas" "No RDB and no AOF on a primary with ${I[connected_slaves]} replica(s)." \
+        "If this primary is restarted automatically it comes back empty and the replicas sync to the empty dataset. Enable RDB/AOF on the primary, or disable automatic restarts and rely on failover."
+    else
+      add INFO "Persistence" "Persistence disabled" "No RDB snapshots and no AOF." \
+        "Fine for a pure cache. Otherwise enable RDB (save) and/or AOF (appendonly yes)."
+    fi
+  fi
+  if (( have_cfg )) && [[ -n $save && $save != "?" ]] && isnum "${I[rdb_last_save_time]:-}"; then
+    local maxint=0 tok j=0
+    for tok in $save; do (( j % 2 == 0 )) && isnum "$tok" && (( tok > maxint )) && maxint=$tok; ((j++)); done
+    x=$(( now - ${I[rdb_last_save_time]} ))
+    if (( maxint > 0 && x > maxint * 2 && ${I[rdb_changes_since_last_save]:-0} > 0 && uptime > maxint * 2 )); then
+      add WARN "Persistence" "No recent RDB snapshot" "Last successful save $(hdur "$x") ago with $(commas "${I[rdb_changes_since_last_save]}") changes pending (save \"$save\")." \
+        "Snapshots are not being written as configured. Check the log for failed or skipped BGSAVE."
+    fi
+  fi
+  if (( forkms >= 1000 )); then
+    y=WARN; (( forkms >= 5000 )) && y=CRIT
+    add "$y" "Persistence" "Slow fork" "Last fork took $forkms ms; the server is blocked for this time (BGSAVE, AOF rewrite, full sync)." \
+      "Fork time grows with memory size. Disable Transparent Huge Pages, keep instances smaller (shard), avoid hypervisors with slow fork, and run BGSAVE on replicas instead of the primary."
+  fi
+
+  # Replication ---------------------------------------------------------
+  if [[ $role == master ]]; then
+    for k in "${!I[@]}"; do
+      [[ $k =~ ^slave[0-9]+$ ]] || continue
+      local ip pt st lg
+      kv ip "${I[$k]}" ip; kv pt "${I[$k]}" port; kv st "${I[$k]}" state; kv lg "${I[$k]}" lag
+      [[ $st != online ]] && add WARN "Replication" "Replica not online" "Replica $ip:$pt state=$st." \
+        "A replica in wait_bgsave/send_bulk is doing a full sync. If it repeats, check client-output-buffer-limit replica and repl-backlog-size."
+      (( ${lg:-0} > 10 )) && add WARN "Replication" "Replica lag" "Replica $ip:$pt lag ${lg}s." \
+        "Check network bandwidth between primary and replica, replica CPU and slow commands on the replica."
+    done
+    x=${I[sync_partial_err]:-0}
+    (( x > 0 )) && add WARN "Replication" "Partial resynchronizations failed" "sync_partial_err=$x, sync_full=${I[sync_full]:-0}, repl-backlog-size $(hb "${I[repl_backlog_size]:-0}")." \
+      "Replicas could not continue from the backlog and needed a full sync. Increase repl-backlog-size to about write bytes/s x the longest expected disconnection (seconds)."
+    if (( ${I[connected_slaves]:-0} > 0 && ${I[repl_backlog_size]:-0} <= 1048576 )); then
+      add INFO "Replication" "Small replication backlog" "repl-backlog-size $(hb "${I[repl_backlog_size]:-0}")." \
+        "A 1MB backlog only covers short disconnections on a busy primary. Values of 64MB-256MB+ are common; size it from the write rate."
+    fi
+    [[ ${C[repl-diskless-sync]:-} == no ]] && (( ${I[connected_slaves]:-0} > 0 )) && add INFO "Replication" "Disk-based full sync" "repl-diskless-sync no." \
+      "With fast networks, repl-diskless-sync yes (default since 7.0) avoids writing the RDB file to disk for each full sync."
+    x=${C[client-output-buffer-limit]:-}
+    if [[ -n $x ]] && (( used > 10737418240 )); then
+      y=$(awk '{ for (i = 1; i <= NF; i++) if ($i == "replica" || $i == "slave") { print $(i + 1); exit } }' <<< "$x")
+      if isnum "$y" && (( y > 0 && y <= 268435456 )); then
+        add INFO "Replication" "Replica output buffer limit may be small" "client-output-buffer-limit replica hard limit $(hb "$y") for a $(hb "$used") dataset." \
+          "During a full sync the primary buffers writes for the replica. If the limit is hit, the sync restarts in a loop. Raise the replica limit (e.g. 1-2GB) on write-heavy primaries."
+      fi
+    fi
+  elif [[ $role == slave ]]; then
+    if [[ ${I[master_link_status]:-} != up ]]; then
+      add CRIT "Replication" "Replication link down" "Link to primary ${I[master_host]:-?}:${I[master_port]:-?} is ${I[master_link_status]:-?} (down for ${I[master_link_down_since_seconds]:-?}s)." \
+        "Check network, masterauth/masteruser, the primary's log and protected-mode/bind on the primary."
+    elif (( ${I[master_last_io_seconds_ago]:-0} > 30 )); then
+      add WARN "Replication" "No data from primary recently" "master_last_io_seconds_ago=${I[master_last_io_seconds_ago]}." \
+        "The primary pings replicas every repl-ping-replica-period seconds; a long silence means network or primary problems."
+    fi
+    [[ ${I[master_sync_in_progress]:-0} == 1 ]] && add WARN "Replication" "Full sync in progress" "The replica is loading a full copy from the primary." \
+      "Expected after a restart. Repeated full syncs point to a small repl-backlog-size or replica output buffer limits."
+    [[ ${C[replica-read-only]:-yes} == no ]] && add WARN "Replication" "Writable replica" "replica-read-only no." \
+      "Writes to a replica are lost on the next sync and make data diverge. Set replica-read-only yes."
+  fi
+
+  # Clients ----------------------------------------------------------------
+  if isnum "$maxclients" && (( maxclients > 0 )); then
+    x=$(( cc * 100 / maxclients ))
+    if (( x >= 80 )); then
+      y=WARN; (( x >= 95 )) && y=CRIT
+      add "$y" "Clients" "Connections close to maxclients" "$(commas "$cc") of $(commas "$maxclients") ($x%)." \
+        "Check for connection leaks or oversized pools (see top client addresses). Raise maxclients only together with the open files limit."
+    fi
+  fi
+  x=${I[rejected_connections]:-0}
+  (( x > 0 )) && add WARN "Clients" "Rejected connections" "$(commas "$x") connections rejected since start (maxclients $maxclients)." \
+    "Clients hit maxclients. Review connection pool sizes and leaks, and maxclients / ulimit -n."
+  if (( uptime > 3600 )); then
+    x=$(( ${I[total_connections_received]:-0} / uptime ))
+    (( x > 50 )) && add WARN "Clients" "High connection rate" "~$x new connections per second on average since start." \
+      "Use persistent connections or connection pooling. Each new connection costs a TCP (and TLS) handshake and work on the main thread."
+  fi
+  if [[ ${C[timeout]:-x} == 0 ]] && (( ${CL[idle1d]:-0} > 100 )); then
+    add INFO "Clients" "Many long idle connections" "${CL[idle1d]} connections idle for more than 1 day, timeout=0." \
+      "Leaked connections use memory and file descriptors. Fix pool settings in the application, or set timeout (e.g. 300-3600s) if clients reconnect transparently."
+  fi
+  [[ ${C[tcp-keepalive]:-x} == 0 ]] && add WARN "Clients" "TCP keepalive disabled" "tcp-keepalive 0." \
+    "Dead peers are never detected. Use tcp-keepalive 300 (the default)."
+  (( ${CL[monitor]:-0} > 0 )) && add WARN "Clients" "MONITOR is running" "${CL[monitor]} client(s) are running MONITOR." \
+    "MONITOR copies every command to the client and can halve throughput. Stop it after debugging."
+  (( ${CL[bigomem]:-0} > 0 )) && add WARN "Clients" "Clients with large output buffers" "${CL[bigomem]} client(s) above 32MB output buffer; largest $(hb "${CL[maxomem]}") (${CL[maxomem_c]})." \
+    "Large replies (HGETALL/SMEMBERS/LRANGE on big keys, KEYS) or slow consumers (pub/sub). Check the commands and client-output-buffer-limit."
+  x=${I[client_recent_max_output_buffer]:-0}
+  if isnum "$x" && (( x > 67108864 && ${CL[bigomem]:-0} == 0 )); then
+    add INFO "Clients" "Large reply buffers seen recently" "client_recent_max_output_buffer $(hb "$x")." \
+      "A client recently received a very large reply. Look for commands returning big collections."
+  fi
+
+  # Performance --------------------------------------------------------
+  x=${C[slowlog-log-slower-than]:-}
+  if [[ $x == -1 ]]; then
+    add WARN "Performance" "Slow log disabled" "slowlog-log-slower-than -1." "Enable it: CONFIG SET slowlog-log-slower-than 10000 (10ms)."
+  elif isnum "$x" && (( x > 100000 )); then
+    add INFO "Performance" "Slow log threshold is high" "slowlog-log-slower-than ${x}us ($(( x / 1000 ))ms)." "A 10ms threshold (10000) is a good default for troubleshooting."
+  fi
+  [[ ${C[latency-monitor-threshold]:-x} == 0 ]] && add INFO "Performance" "Latency monitor disabled" "latency-monitor-threshold 0." \
+    "CONFIG SET latency-monitor-threshold 100 records spikes from fork, AOF, expiry, eviction and commands (see LATENCY DOCTOR)."
+
+  local kc=""; kv kc "${I[cmdstat_keys]:-}" calls
+  if (( ${kc:-0} > 0 )); then
+    local ku=""; kv ku "${I[cmdstat_keys]}" usec_per_call
+    add WARN "Performance" "KEYS command in use" "KEYS called $(commas "$kc") times (avg ${ku}us per call)." \
+      "KEYS scans the whole keyspace and blocks the server. Use SCAN with MATCH/COUNT, or keep an index in a SET. You can block it with ACL (-keys)."
+  fi
+  for k in flushall flushdb; do
+    kc=""; kv kc "${I[cmdstat_$k]:-}" calls
+    (( ${kc:-0} > 0 )) && add INFO "Performance" "${k^^} used" "${k^^} called $kc time(s) since start." \
+      "Make sure this is intended. With lazyfree-lazy-user-flush yes or ${k^^} ASYNC the server is not blocked."
+  done
+  local slowcmds
+  slowcmds=$(awk -F'\t' 'NR > 1 && $2 >= 100 && $4 >= 1000 { printf "%s%s (%s calls, %sus/call)", (n++ ? ", " : ""), $1, $2, $4 }' "$r/cmdstats.tsv")
+  [[ -n $slowcmds ]] && add WARN "Performance" "Commands with high average latency" "Average >= 1ms: $slowcmds." \
+    "Slow commands block the single main thread. Look for O(N) commands on big keys (HGETALL, SMEMBERS, LRANGE 0 -1, ZRANGE, SUNION, SORT, DEL on big keys), large Lua scripts or MULTI blocks. Use SCAN-family commands, UNLINK and smaller keys."
+  if [[ -s $r/slowlog.raw ]]; then
+    local sl_n sl_max sl_top
+    sl_n=$(wc -l < "$r/slowlog.raw")
+    sl_max=$(sort -t$'\t' -k3,3nr "$r/slowlog.raw" | head -1 | cut -f3)
+    sl_top=$(awk -F'\t' 'NR > 1 && NR <= 4 { printf "%s%s (%s)", (n++ ? ", " : ""), $1, $2 }' "$r/slowlog_summary.tsv")
+    y=INFO; (( ${sl_max:-0} >= 1000000 )) && y=WARN
+    add "$y" "Performance" "Slow log entries" "$sl_n entries in the slow log (total logged ${I[slowlog_len]:-$(cat "$d/slowlog_len.txt" 2>/dev/null)}); slowest $(( ${sl_max:-0} / 1000 ))ms; top: $sl_top." \
+      "Review the slow log table. Common causes: O(N) commands on large keys, KEYS, big DEL (use UNLINK), Lua scripts and big MULTI/EXEC transactions."
+  fi
+  if [[ $(wc -l < "$r/latency.tsv") -gt 1 ]]; then
+    x=$(awk -F'\t' 'NR > 1 { printf "%s%s (max %sms)", (n++ ? ", " : ""), $1, $4 }' "$r/latency.tsv")
+    add WARN "Performance" "Latency spikes recorded" "LATENCY LATEST: $x." \
+      "See LATENCY DOCTOR in the node details. fork: reduce dataset per instance / disable THP; aof-*: slow disk; cluster-config-*fsync: slow disk for nodes.conf (blocks the main thread on cluster changes); expire-cycle / eviction-*: many keys expiring or evicted at once; command / fast-command: slow commands or CPU starvation."
+  fi
+  if (( hits + misses > 100000 && hitr >= 0 && hitr < 800 )); then
+    add INFO "Performance" "Low keyspace hit ratio" "Hit ratio $(( hitr / 10 )).$(( hitr % 10 ))% ($(commas "$misses") misses)." \
+      "For a cache this means many lookups miss: keys expire too early, are evicted, or the application reads keys that never exist. For other workloads it may be normal."
+  fi
+  f100 x "${I[expired_stale_perc]:-0}"
+  (( x >= 2500 && keys > 10000 )) && add INFO "Performance" "Many expired keys not yet removed" "expired_stale_perc ${I[expired_stale_perc]}%." \
+    "Active expiry cannot keep up. Raise active-expire-effort (1-10, default 1) or hz, or spread key TTLs."
+  (( ${I[expired_time_cap_reached_count]:-0} > 0 )) && add INFO "Performance" "Active expire cycle hit its time limit" \
+    "expired_time_cap_reached_count ${I[expired_time_cap_reached_count]}." "Many keys expire at the same time. Add jitter to TTLs; consider active-expire-effort."
+  if (( have_cfg )); then
+    y=""
+    for k in lazyfree-lazy-eviction lazyfree-lazy-expire lazyfree-lazy-server-del lazyfree-lazy-user-del replica-lazy-flush; do
+      [[ ${C[$k]:-} == no ]] && y+="$k "
+    done
+    [[ -n $y ]] && add INFO "Performance" "Lazy freeing disabled" "Set to no: ${y% }." \
+      "With yes, large keys are freed in a background thread instead of blocking the main thread (the default in Valkey 8). Safe to enable at runtime with CONFIG SET."
+  fi
+  if [[ ${C[io-threads]:-1} == 1 ]] && (( ops > 50000 )); then
+    add INFO "Performance" "Single I/O thread under high load" "io-threads 1 with $(commas "$ops") ops/sec." \
+      "On hosts with spare cores, io-threads 4-8 (Valkey 8 greatly improved I/O threading) can increase throughput. Test first."
+  fi
+  if awk -v c="$cpu_pct" 'BEGIN { exit !(c >= 70) }'; then
+    add WARN "Performance" "Main thread busy" "Main thread used ${cpu_pct}% of one CPU on average since start." \
+      "The main thread is close to saturation. Shard the data, move reads to replicas, enable io-threads, and remove slow commands."
+  fi
+  x=${C[hz]:-}
+  isnum "$x" && (( x < 10 )) && add INFO "Performance" "Low hz" "hz $x." "The default hz 10 keeps expiry and timeouts timely."
+
+  # Error statistics
+  local cnt
+  for k in NOAUTH WRONGPASS; do
+    cnt=""; kv cnt "${I[errorstat_$k]:-}" count
+    (( ${cnt:-0} > 100 )) && add WARN "Security" "Authentication failures" "errorstat_$k count=$(commas "$cnt")." \
+      "A client uses wrong or missing credentials (or someone is guessing passwords). Find it in CLIENT LIST / the logs."
+  done
+  cnt=""; kv cnt "${I[errorstat_MOVED]:-}" count
+  local tcp=${I[total_commands_processed]:-0}
+  if (( ${cnt:-0} > 1000 && tcp > 0 && cnt * 1000 / tcp >= 1 )); then
+    add INFO "Cluster" "Many MOVED redirections" "$(commas "$cnt") MOVED replies since start." \
+      "Clients do not track the slot map: use a cluster-aware client that refreshes the topology, or check it after resharding."
+  fi
+  cnt=""; kv cnt "${I[errorstat_BUSY]:-}" count
+  (( ${cnt:-0} > 0 )) && add WARN "Performance" "BUSY errors (long scripts)" "errorstat_BUSY count=$cnt." \
+    "A Lua script or function ran longer than busy-reply-threshold (lua-time-limit) and blocked the server. Make scripts shorter."
+  cnt=""; kv cnt "${I[errorstat_READONLY]:-}" count
+  (( ${cnt:-0} > 0 )) && add INFO "Clients" "Writes sent to a replica" "errorstat_READONLY count=$cnt." \
+    "A client sends writes to a read-only replica, often after a failover when the client still points at the old primary."
+
+  # Security ------------------------------------------------------------
+  local nopass=0
+  if [[ -s $d/acl.txt ]]; then
+    grep -Eq '^user default on .*nopass' "$d/acl.txt" && nopass=1
+    x=$(awk '$1 == "user" && $2 != "default" && $3 == "on" && / nopass/ { printf "%s%s", (n++ ? ", " : ""), $2 }' "$d/acl.txt")
+    [[ -n $x ]] && add WARN "Security" "ACL users without password" "Enabled users with nopass: $x." "Give every enabled user a password (ACL SETUSER <user> resetpass >password)."
+  elif [[ ${C[requirepass]-x} == "" ]]; then
+    nopass=1
+  fi
+  if (( nopass )); then
+    local remote=0
+    [[ ${M[auth_used]:-0} == 0 && ${M[seed]%:*} != 127.* && ${M[seed]%:*} != localhost && ${M[seed]%:*} != ::1 ]] && remote=1
+    if [[ ${C[protected-mode]:-yes} == no ]] || (( remote )); then
+      add CRIT "Security" "No authentication" "The default user has no password and protected-mode is ${C[protected-mode]:-?} (bind: ${C[bind]:-?})." \
+        "Anyone who reaches the port has full access (including CONFIG and FLUSHALL). Set a password (requirepass or ACL users), bind to private interfaces and firewall the port."
+    else
+      add WARN "Security" "Default user has no password" "Only protected-mode (${C[protected-mode]:-?}) limits access to loopback." \
+        "Set requirepass or create ACL users with passwords, and disable the default user if it is not needed."
+    fi
+  fi
+  for k in enable-debug-command enable-module-command enable-protected-configs; do
+    [[ ${C[$k]:-} == yes ]] && add WARN "Security" "$k yes" "$k is enabled for remote clients." "Set $k to no (or local) unless it is required."
+  done
+
+  # Keyspace ---------------------------------------------------------------
+  (( cluster == 0 && dbs > 1 )) && add INFO "Keyspace" "Multiple logical databases" "$dbs databases have keys." \
+    "Logical databases share one thread, memory limit and persistence. Separate instances isolate workloads better, and cluster mode only supports database 0 (before Valkey 9)."
+  [[ $role == master ]] && (( keys == 0 && cluster == 0 )) && add INFO "Keyspace" "Empty dataset" "No keys." "Check that clients use this instance."
+  [[ -s $d/bigkeys.txt ]] && add INFO "Keyspace" "Big keys scan available" "--bigkeys / --memkeys output is in the node details." "Large keys block the server when read in full or deleted; split them or use UNLINK."
+
+  # Local process -------------------------------------------------------
+  if [[ -s $d/proc_limits.txt ]]; then
+    x=$(awk '/^Max open files/ { print $4 }' "$d/proc_limits.txt")
+    if isnum "$x" && isnum "$maxclients" && (( x < maxclients + 32 )); then
+      add WARN "OS" "Open files limit below maxclients" "Process nofile limit $x < maxclients $maxclients + 32." \
+        "Raise LimitNOFILE (systemd) or ulimit -n for the service; otherwise maxclients is reduced at startup."
+    fi
+  fi
+  if [[ -s $d/proc_status.txt ]]; then
+    x=$(awk '/^VmSwap:/ { print $2 }' "$d/proc_status.txt")
+    isnum "$x" && (( x > 10240 )) && add WARN "OS" "Process is swapping" "VmSwap $(hb $(( x * 1024 )))." \
+      "Swapped pages make commands very slow. Ensure maxmemory fits in RAM, lower vm.swappiness and check other memory consumers."
+  fi
+  if [[ -s $d/df_dir.txt ]]; then
+    x=$(awk 'NR == 2 { gsub(/%/, "", $5); print $5 }' "$d/df_dir.txt")
+    if isnum "$x" && (( x >= 80 )); then
+      y=WARN; (( x >= 90 )) && y=CRIT
+      add "$y" "Persistence" "Data directory filesystem almost full" "${C[dir]:-?} is $x% full." \
+        "RDB/AOF rewrites need free space of about the dataset size. Free space or move dir."
+    fi
+  fi
+}
+
+# ---- cluster wide checks
+# CLUSTER NODES flags: "fail" = agreed failure, "fail?" = suspected (pfail)
+is_failed() { [[ ",$1," == *",fail,"* ]]; }
+is_pfail()  { [[ ",$1," == *",fail?,"* ]]; }
+
+check_cluster() {
+  local seed="" lab
+  for lab in "${NODES[@]}"; do
+    [[ -s $OUTDIR/nodes/${N_DIR[$lab]}/cluster_nodes.txt ]] && { seed="$OUTDIR/nodes/${N_DIR[$lab]}"; SEED_LAB=$lab; break; }
+  done
+  [[ -z $seed ]] && return
+  IS_CLUSTER=1
+
+  awk '{ sub(/\r$/, ""); id = $1; a = $2; hn = ""
+         if (index(a, ",")) { split(a, z, ","); a = z[1]; hn = z[2]; if (hn ~ /=/) hn = "" }
+         sub(/@.*/, "", a); fl = $3; m = $4; ep = $7; ln = $8; cnt = 0; rg = ""; op = ""
+         for (i = 9; i <= NF; i++) { t = $i
+           if (substr(t, 1, 1) == "[") { op = (op == "" ? t : op " " t); continue }
+           if (index(t, "-")) { split(t, b, "-"); cnt += b[2] - b[1] + 1 } else cnt++
+           rg = (rg == "" ? t : rg " " t) }
+         first = rg; sub(/[- ].*/, "", first); if (first == "") first = 99999
+         print id "|" a "|" hn "|" fl "|" m "|" ep "|" ln "|" cnt "|" rg "|" op "|" first }' \
+    "$seed/cluster_nodes.txt" > "$RPT/cluster_nodes.psv"
+
+  local -A CI=()
+  local k v
+  while IFS=: read -r k v; do v=${v%$'\r'}; [[ -n $k ]] && CI[$k]=$v; done < "$seed/cluster_info.txt"
+  CLUSTER_STATE=${CI[cluster_state]:-?}; CLUSTER_SIZE=${CI[cluster_size]:-?}; CLUSTER_KNOWN=${CI[cluster_known_nodes]:-?}
+
+  local bad=""
+  for lab in "${NODES[@]}"; do [[ -n ${N_CSTATE[$lab]:-} && ${N_CSTATE[$lab]} != ok ]] && bad+="$lab "; done
+  [[ -n $bad ]] && addg CRIT "${bad% }" "Cluster" "Cluster state is fail" "cluster_state is not ok on: ${bad% }." \
+    "Some slots are not served (a shard lost its primary and could not fail over, or slots are unassigned). Run valkey-cli --cluster check <node> and check the failed nodes."
+  local assigned=${CI[cluster_slots_assigned]:-16384}
+  (( assigned < 16384 )) && addg CRIT "" "Cluster" "Unassigned hash slots" "Only $assigned of 16384 slots are assigned." \
+    "Keys in unassigned slots cannot be used and, with cluster-require-full-coverage yes, the whole cluster stops. Use valkey-cli --cluster fix or CLUSTER ADDSLOTS."
+  if (( ${CI[cluster_slots_pfail]:-0} + ${CI[cluster_slots_fail]:-0} > 0 )); then
+    addg CRIT "" "Cluster" "Slots in failing state" "slots_pfail=${CI[cluster_slots_pfail]:-0}, slots_fail=${CI[cluster_slots_fail]:-0} (seen from $SEED_LAB)." \
+      "Nodes serving these slots are unreachable. Check those nodes and whether failover happened."
+  fi
+
+  local id a hn fl m ep ln cnt rg op first
+  local -A MREP=() HOSTM=() EPOCHS=()
+  local masters=0 maxs=0 mins=16384 tots=0 nslots=0 failed="" pfailed="" openslots="" noslot="" lab2
+  while IFS='|' read -r id a hn fl m ep ln cnt rg op first; do
+    local host=${a%:*}
+    if is_failed "$fl"; then failed+="$a "; elif is_pfail "$fl"; then pfailed+="$a "; fi
+    [[ -n $op ]] && openslots+="$a: $op; "
+    if [[ $fl == *master* ]]; then
+      is_failed "$fl" && continue
+      ((masters++))
+      HOSTM[$host]=$(( ${HOSTM[$host]:-0} + 1 ))
+      [[ -n ${EPOCHS[$ep]:-} ]] && EPOCHS[$ep]+=" $a" || EPOCHS[$ep]=$a
+      if (( cnt > 0 )); then
+        ((nslots++)); tots=$(( tots + cnt ))
+        (( cnt > maxs )) && maxs=$cnt; (( cnt < mins )) && mins=$cnt
+      else
+        noslot+="$a "
+      fi
+    elif [[ $m != - ]]; then
+      MREP[$m]+="$host "
+    fi
+  done < "$RPT/cluster_nodes.psv"
+
+  [[ -n $failed ]] && addg CRIT "${failed% }" "Cluster" "Nodes marked as failed" "Nodes flagged fail: ${failed% }." \
+    "Bring the nodes back or remove them (CLUSTER FORGET on every node / valkey-cli --cluster del-node) after replacing them."
+  [[ -n $pfailed ]] && addg WARN "${pfailed% }" "Cluster" "Nodes possibly failing (pfail)" "Nodes flagged pfail: ${pfailed% }." \
+    "These nodes did not answer pings within cluster-node-timeout. Check network and load."
+  [[ -n $openslots ]] && addg WARN "" "Cluster" "Slots in migrating/importing state" "${openslots%; }." \
+    "A resharding is running or was interrupted. If nothing is running, use valkey-cli --cluster fix or CLUSTER SETSLOT <slot> STABLE / NODE."
+  [[ -n $noslot ]] && addg WARN "${noslot% }" "Cluster" "Primaries without slots" "Primaries serving no slots: ${noslot% }." \
+    "Empty primaries waste resources. Rebalance (valkey-cli --cluster rebalance --cluster-use-empty-masters) or make them replicas."
+
+  # HA: primaries without replicas / replicas on the same host as the primary
+  local norep="" samehost=""
+  while IFS='|' read -r id a hn fl m ep ln cnt rg op first; do
+    [[ $fl == *master* ]] || continue
+    is_failed "$fl" && continue
+    (( cnt > 0 )) || continue
+    local host=${a%:*} reps=${MREP[$id]:-}
+    if [[ -z $reps ]]; then norep+="$a "
+    else
+      local r ok=0
+      for r in $reps; do [[ $r != "$host" ]] && ok=1; done
+      (( ok )) || samehost+="$a "
+    fi
+  done < "$RPT/cluster_nodes.psv"
+  [[ -n $norep ]] && addg WARN "${norep% }" "Cluster" "Primaries without replicas" "No replica for: ${norep% }." \
+    "If one of these primaries fails its slots are lost and the cluster goes down (with cluster-require-full-coverage yes). Add at least one replica per primary."
+  [[ -n $samehost ]] && addg WARN "${samehost% }" "Cluster" "Primary and replicas on the same host" "All replicas of ${samehost% } are on the primary's host/IP." \
+    "Losing that host loses the whole shard. Place replicas on other hosts / availability zones. (Containers: check the physical host, IPs differ per pod.)"
+  local hosts=${#HOSTM[@]} hmax=0 hname=""
+  for k in "${!HOSTM[@]}"; do (( ${HOSTM[$k]} > hmax )) && { hmax=${HOSTM[$k]}; hname=$k; }; done
+  if (( masters > 1 && hmax * 2 >= masters )); then
+    if (( hosts == 1 )); then
+      addg CRIT "" "Cluster" "All primaries on one host" "All $masters primaries are on $hname." \
+        "A single host failure takes down the whole cluster. Spread primaries across hosts so no host holds half or more of them. (Containers: IPs may hide that pods share a node.)"
+    else
+      addg CRIT "" "Cluster" "Half or more of the primaries on one host" "$hname holds $hmax of $masters primaries." \
+        "If $hname fails, the remaining primaries are not a majority and cannot elect replacements: the cluster stays down. Spread primaries across hosts."
+    fi
+  fi
+  for k in "${!EPOCHS[@]}"; do
+    [[ ${EPOCHS[$k]} == *" "* ]] && addg WARN "" "Cluster" "Config epoch collision" "Primaries share config epoch $k: ${EPOCHS[$k]}." \
+      "Normally resolved automatically; if it persists, check CLUSTER NODES on every node."
+  done
+  if (( nslots > 1 )); then
+    local avg=$(( tots / nslots ))
+    (( avg > 0 && (maxs - mins) * 100 / avg > 20 )) && addg INFO "" "Cluster" "Uneven slot distribution" "Slots per primary from $mins to $maxs (avg $avg)." \
+      "Use valkey-cli --cluster rebalance if the load follows the slot count."
+  fi
+
+  # Data skew between primaries (by node ID mapping)
+  local -a mk=() mm=() mo=()
+  while IFS='|' read -r id a hn fl m ep ln cnt rg op first; do
+    [[ $fl == *master* ]] && (( cnt > 0 )) || continue
+    lab2=${ID2LAB[$id]:-}; [[ -z $lab2 ]] && continue
+    mk+=("${N_KEYS[$lab2]:-0}"); mm+=("${N_USED[$lab2]:-0}"); mo+=("${N_OPS[$lab2]:-0}")
+  done < "$RPT/cluster_nodes.psv"
+  if (( ${#mk[@]} > 1 )); then
+    local s=0 mx=0 i
+    for i in "${mk[@]}"; do s=$(( s + i )); (( i > mx )) && mx=$i; done
+    if (( s > 10000 && mx * ${#mk[@]} * 100 > s * 150 )); then
+      addg WARN "" "Cluster" "Uneven key distribution" "Largest primary has $(commas "$mx") keys, average $(commas $(( s / ${#mk[@]} )))." \
+        "Usually hash tags ({...}) put too many keys in a few slots, or slots are unevenly spread. Review hash tag usage and rebalance."
+    fi
+    s=0; mx=0
+    for i in "${mm[@]}"; do s=$(( s + i )); (( i > mx )) && mx=$i; done
+    if (( mx > 104857600 && mx * ${#mm[@]} * 100 > s * 150 )); then
+      addg WARN "" "Cluster" "Uneven memory usage" "Largest primary uses $(hb "$mx"), average $(hb $(( s / ${#mm[@]} )))." \
+        "Big keys or hash-tag hot spots concentrate memory on one shard. Run with --bigkeys to find them."
+    fi
+    s=0; mx=0
+    for i in "${mo[@]}"; do s=$(( s + i )); (( i > mx )) && mx=$i; done
+    if (( s > 1000 && mx * ${#mo[@]} > s * 3 )); then
+      addg INFO "" "Cluster" "Hot shard" "Busiest primary does $(commas "$mx") ops/s, average $(commas $(( s / ${#mo[@]} )))." \
+        "A few hot keys or hash tags drive the load. Check the slow log / commandstats on that node and consider client-side caching or key splitting."
+    fi
+  fi
+
+  # Views differ between nodes
+  local kn="" vals=""
+  for lab in "${NODES[@]}"; do [[ -n ${N_KNOWN[$lab]:-} ]] && vals+="${N_KNOWN[$lab]} "; done
+  kn=$(tr ' ' '\n' <<< "$vals" | sort -u | grep -c .)
+  (( kn > 1 )) && addg WARN "" "Cluster" "Nodes disagree on cluster membership" "cluster_known_nodes differs between nodes: $(tr ' ' '\n' <<< "$vals" | sort | uniq -c | awk '{ printf "%s%s node(s) know %s", (n++ ? ", " : ""), $1, $2 }')." \
+    "A node was added/removed without informing all nodes. Run CLUSTER NODES on each node; CLUSTER FORGET stale entries or CLUSTER MEET missing ones."
+
+  # Cluster configuration
+  local fc=${CFGALL["$SEED_LAB|cluster-require-full-coverage"]:-}
+  [[ $fc == yes ]] && addg INFO "" "Cluster" "Full coverage required" "cluster-require-full-coverage yes." \
+    "If any shard loses all its nodes, the whole cluster stops serving. Set it to no if the application prefers partial availability."
+  local nt=${CFGALL["$SEED_LAB|cluster-node-timeout"]:-}
+  if isnum "$nt"; then
+    (( nt < 5000 )) && addg INFO "" "Cluster" "Short cluster-node-timeout" "cluster-node-timeout ${nt}ms." \
+      "Very short timeouts can trigger failovers on brief network hiccups or long forks. 15000 (default) is safer unless fast failover is required."
+    (( nt > 60000 )) && addg INFO "" "Cluster" "Long cluster-node-timeout" "cluster-node-timeout ${nt}ms." "Failover takes at least this long."
+  fi
+}
+
+check_groups() {
+  # Unreachable nodes
+  local x
+  for x in "${UNREACHABLE[@]}"; do
+    addg WARN "${x%%|*}" "Collection" "Node unreachable" "Could not collect ${x%%|*}: ${x#*|}" \
+      "Check network, firewall and credentials from the collector host. Announced addresses (cluster-announce-ip / replica-announce-ip) must be reachable, or pass --nodes. Other nodes may report this node as failed."
+  done
+  # Versions differ
+  local lab vals=""
+  for lab in "${NODES[@]}"; do vals+="${N_PRODUCT[$lab]} ${N_VER[$lab]}"$'\n'; done
+  if (( $(sort -u <<< "$vals" | grep -c .) > 1 )); then
+    addg WARN "" "Version" "Mixed versions" "$(sort <<< "$vals" | grep . | uniq -c | awk '{ printf "%s%s x %s %s", (n++ ? ", " : ""), $1, $2, $3 }')." \
+      "Mixed versions are expected only during a rolling upgrade. Finish the upgrade so all nodes behave the same."
+  fi
+  # Primary/replica on the same host (non cluster)
+  if (( ! IS_CLUSTER )); then
+    for lab in "${NODES[@]}"; do
+      [[ ${N_ROLE[$lab]} == slave ]] || continue
+      local mh=${N_MASTER[$lab]%:*}
+      [[ -n $mh && $mh == "${lab%:*}" ]] && addg INFO "$lab" "Replication" "Replica on the same host as its primary" "$lab replicates from ${N_MASTER[$lab]}." \
+        "A host failure takes both down. Place replicas on another host for availability."
+    done
+  fi
+  # Memory over-commit per host (sum of maxmemory of instances sharing an address)
+  local -A HSUM=() HMEM=() HCNT=()
+  for lab in "${NODES[@]}"; do
+    local h=${lab%:*}
+    HSUM[$h]=$(( ${HSUM[$h]:-0} + ${N_MAX[$lab]:-0} )); HCNT[$h]=$(( ${HCNT[$h]:-0} + 1 ))
+    [[ ${N_SYSMEM[$lab]:-0} -gt 0 ]] && HMEM[$h]=${N_SYSMEM[$lab]}
+  done
+  for x in "${!HSUM[@]}"; do
+    (( ${HCNT[$x]} > 1 && ${HMEM[$x]:-0} > 0 && ${HSUM[$x]} > ${HMEM[$x]:-0} * 85 / 100 )) &&
+      addg WARN "$x" "Memory" "Instances on one host can use more than its RAM" \
+        "${HCNT[$x]} instances on $x have maxmemory totalling $(hb "${HSUM[$x]}"); the host has $(hb "${HMEM[$x]}")." \
+        "Lower maxmemory per instance so the total stays below ~70% of RAM, or move instances to other hosts."
+  done
+  # Configuration drift on important parameters
+  check_config_drift
+}
+
+check_config_drift() {
+  local k lab v drift="" n_nodes=${#NODES[@]}
+  local -A VN=()
+  (( n_nodes > 1 )) || return
+  : > "$RPT/config_diff.tsv.tmp"
+  for k in $(printf '%s\n' "${!CFGKEYS[@]}" | sort); do
+    [[ $NODE_SPECIFIC_CFG == *[[:space:]]$k[[:space:]]* ]] && continue
+    VN=()
+    for lab in "${NODES[@]}"; do
+      v=${CFGALL["$lab|$k"]-__missing__}
+      VN["=$v"]+="$lab "
+    done
+    if (( ${#VN[@]} > 1 )); then
+      local line=""
+      for v in "${!VN[@]}"; do
+        local nl=${VN[$v]% }; local c; c=$(wc -w <<< "$nl")
+        line+="${line:+ | }${v#=} [$c: ${nl// /, }]"
+      done
+      printf '%s\t%s\n' "$k" "$line" >> "$RPT/config_diff.tsv.tmp"
+      [[ " $KEY_CFG " == *[[:space:]]$k[[:space:]]* ]] && drift+="$k "
+    fi
+  done
+  { printf 'Parameter\tValues [nodes]\n'; cat "$RPT/config_diff.tsv.tmp"; } > "$RPT/config_diff.tsv"
+  rm -f "$RPT/config_diff.tsv.tmp"
+  [[ -n $drift ]] && addg WARN "" "Configuration" "Configuration differs between nodes" "Important parameters differ: ${drift% }." \
+    "After a failover a replica becomes primary with its own settings. Keep these parameters identical (and persisted in the config file) on all nodes."
+}
+
+check_os() {
+  local f="$OUTDIR/os/os.txt" k v
+  [[ -s $f ]] || return
+  while IFS='=' read -r k v; do [[ -n $k ]] && OSV[$k]=$v; done < "$f"
+  local h=${OSV[hostname]:-local}
+  [[ ${OSV[thp_enabled]:-} == *"[always]"* ]] && addg WARN "$h" "OS" "Transparent Huge Pages enabled" "THP: ${OSV[thp_enabled]}." \
+    "THP causes latency spikes and much higher memory use after fork. Disable it: echo never > /sys/kernel/mm/transparent_hugepage/enabled (make it persistent with a systemd unit or kernel parameter transparent_hugepage=never)."
+  v=${OSV[vm.overcommit_memory]:-}
+  [[ -n $v && $v != 1 ]] && addg WARN "$h" "OS" "vm.overcommit_memory is not 1" "vm.overcommit_memory=$v." \
+    "With 0 the fork for BGSAVE / AOF rewrite can fail under memory pressure. Set vm.overcommit_memory = 1 in /etc/sysctl.conf and run sysctl -p."
+  v=${OSV[vm.swappiness]:-}
+  isnum "$v" && (( v > 10 )) && addg INFO "$h" "OS" "High vm.swappiness" "vm.swappiness=$v." \
+    "A low value (1-10) makes the kernel less likely to swap out Valkey memory."
+  v=${OSV[net.core.somaxconn]:-}
+  local lab tb=0
+  for lab in "${NODES[@]}"; do
+    local x=${CFGALL["$lab|tcp-backlog"]:-0}; isnum "$x" && (( x > tb )) && tb=$x
+  done
+  isnum "$v" && (( tb > v )) && addg WARN "$h" "OS" "net.core.somaxconn below tcp-backlog" "somaxconn=$v, tcp-backlog=$tb." \
+    "The kernel silently caps the backlog. Set net.core.somaxconn (and net.ipv4.tcp_max_syn_backlog) to at least $tb."
+  v=${OSV[cgroup_memory_limit]:-}
+  if isnum "$v"; then
+    local sum=0
+    for lab in "${NODES[@]}"; do [[ -s $OUTDIR/nodes/${N_DIR[$lab]}/proc_limits.txt ]] && sum=$(( sum + ${N_MAX[$lab]:-0} )); done
+    (( sum > 0 && sum > v * 85 / 100 )) && addg CRIT "$h" "OS" "maxmemory close to container memory limit" \
+      "Container memory limit $(hb "$v"), maxmemory of local instances $(hb "$sum")." \
+      "The container is OOM-killed before maxmemory protects it. Keep maxmemory at ~60-75% of the container limit."
+  fi
+  local load=${OSV[loadavg]%% *} cpus=${OSV[cpus]:-0}
+  if isnum "$cpus" && (( cpus > 0 )) && awk -v l="$load" -v c="$cpus" 'BEGIN { exit !(l > c) }'; then
+    addg INFO "$h" "OS" "High load average" "Load ${OSV[loadavg]} on $cpus CPUs." "Check what else runs on the host (top, pidstat) and CPU steal on VMs."
+  fi
+}
+
+group_findings() {
+  awk -F'\t' 'BEGIN { OFS = "\t"; rk["CRIT"] = 1; rk["WARN"] = 2; rk["INFO"] = 3 }
+    { k = $1 SUBSEP $3 SUBSEP $4 SUBSEP $6
+      if (!(k in cnt)) { ord[++n] = k; sev[k] = $1; ar[k] = $3; ti[k] = $4; re[k] = $6; d1[k] = $5 }
+      cnt[k]++
+      if ($2 != "") nodes[k] = (nodes[k] == "" ? $2 : nodes[k] ", " $2)
+      dt[k] = (dt[k] == "" ? "" : dt[k] "\037") ($2 == "" ? "" : $2 ": ") $5 }
+    END { for (i = 1; i <= n; i++) { k = ord[i]; print rk[sev[k]], i, sev[k], ar[k], ti[k], (nodes[k] == "" ? "-" : nodes[k]), cnt[k], d1[k], dt[k], re[k] } }' \
+    "$FINDINGS" | sort -t$'\t' -k1,1n -k2,2n | cut -f3- > "$RPT/findings.tsv"
+  N_CRIT=$(awk -F'\t' '$1 == "CRIT"' "$RPT/findings.tsv" | wc -l)
+  N_WARN=$(awk -F'\t' '$1 == "WARN"' "$RPT/findings.tsv" | wc -l)
+  N_INFO=$(awk -F'\t' '$1 == "INFO"' "$RPT/findings.tsv" | wc -l)
+  local pi=$(( N_INFO )); (( pi > 10 )) && pi=10
+  SCORE=$(( 100 - 15 * N_CRIT - 5 * N_WARN - pi ))
+  (( SCORE < 0 )) && SCORE=0
+  if (( SCORE >= 90 )); then GRADE="Good"; elif (( SCORE >= 70 )); then GRADE="Fair"; elif (( SCORE >= 50 )); then GRADE="Poor"; else GRADE="Critical"; fi
+}
+
+order_nodes() {
+  # Cluster: by shard (first slot), primary then replicas. Otherwise primaries first.
+  local -a out=()
+  local -A done_=()
+  if (( IS_CLUSTER )) && [[ -s $RPT/cluster_nodes.psv ]]; then
+    local id a hn fl m ep ln cnt rg op first rid lab
+    while IFS='|' read -r id a hn fl m ep ln cnt rg op first; do
+      [[ $fl == *master* ]] || continue
+      lab=${ID2LAB[$id]:-}; [[ -n $lab && -z ${done_[$lab]:-} ]] && { out+=("$lab"); done_[$lab]=1; }
+      while IFS='|' read -r rid _ _ _ m _; do
+        [[ $m == "$id" ]] || continue
+        lab=${ID2LAB[$rid]:-}; [[ -n $lab && -z ${done_[$lab]:-} ]] && { out+=("$lab"); done_[$lab]=1; }
+      done < "$RPT/cluster_nodes.psv"
+    done < <(sort -t'|' -k11,11n "$RPT/cluster_nodes.psv")
+  fi
+  local lab
+  for lab in "${NODES[@]}"; do [[ ${N_ROLE[$lab]} == master && -z ${done_[$lab]:-} ]] && { out+=("$lab"); done_[$lab]=1; }; done
+  for lab in "${NODES[@]}"; do [[ -z ${done_[$lab]:-} ]] && { out+=("$lab"); done_[$lab]=1; }; done
+  NODES=("${out[@]}")
+}
+
+build_tables() {
+  local lab x mp fr hr
+  {
+    printf 'Node\tRole\tVersion\tUptime\tUsed memory\tmaxmemory\tMem %%\tFrag\tKeys\tOps/s\tClients\tHit %%\tPersistence\tFork ms\n'
+    for lab in "${NODES[@]}"; do
+      mp="-"; (( ${N_MEMPCT[$lab]} >= 0 )) && mp="${N_MEMPCT[$lab]}%"
+      (( ${N_MEMPCT[$lab]} >= 90 )) && mp="!c!$mp"; (( ${N_MEMPCT[$lab]} >= 80 && ${N_MEMPCT[$lab]} < 90 )) && mp="!w!$mp"
+      fr=${N_FRAG[$lab]}; f100 x "$fr"; (( x >= 150 && ${N_USED[$lab]} > 104857600 )) && fr="!w!$fr"
+      hr="-"; (( ${N_HIT[$lab]} >= 0 )) && hr="$(( ${N_HIT[$lab]} / 10 )).$(( ${N_HIT[$lab]} % 10 ))%"
+      x=${N_ROLE[$lab]}; [[ $x == slave ]] && x="replica"; [[ $x == replica && ${N_LINK[$lab]} != up ]] && x="!c!replica (link ${N_LINK[$lab]})"
+      local mx="!w!none"; (( ${N_MAX[$lab]} > 0 )) && mx=$(hb "${N_MAX[$lab]}")
+      local fk=${N_FORK[$lab]}; (( fk >= 1000 )) && fk="!w!$fk"
+      local up; up=$(hdur "${N_UP[$lab]}")
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$lab" "$x" "${N_PRODUCT[$lab]} ${N_VER[$lab]}" "$up" \
+        "$(hb "${N_USED[$lab]}")" "$mx" "$mp" "$fr" "$(commas "${N_KEYS[$lab]}")" "$(commas "${N_OPS[$lab]}")" \
+        "$(commas "${N_CLIENTS[$lab]}")" "$hr" "${N_PERSIST[$lab]}" "$fk"
+    done
+    for x in "${UNREACHABLE[@]}"; do
+      printf '%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n' "${x%%|*}" "!c!unreachable"
+    done
+  } > "$RPT/overview.tsv"
+
+  if (( IS_CLUSTER )); then
+    {
+      printf 'Shard\tPrimary\tNode ID\tSlots\tSlot ranges\tReplicas\tKeys\tUsed memory\tOps/s\tStatus\n'
+      local id a hn fl m ep ln cnt rg op first shard=0 reps rid ra rfl rln
+      while IFS='|' read -r id a hn fl m ep ln cnt rg op first; do
+        [[ $fl == *master* ]] || continue
+        ((shard++))
+        reps=""
+        while IFS='|' read -r rid ra _ rfl m _ rln _; do
+          [[ $m == "$id" ]] || continue
+          local st="ok"; [[ $rfl == *fail* ]] && st=${rfl//myself,/}; [[ $rln != connected ]] && st+=" $rln"
+          reps+="${reps:+, }$ra${st:+ ($st)}"
+        done < "$RPT/cluster_nodes.psv"
+        [[ -z $reps ]] && reps="!w!none"
+        local status="ok"
+        [[ $fl == *fail* ]] && status="!c!${fl//myself,/}"
+        [[ $ln != connected ]] && status="!c!$ln"
+        [[ -n $op ]] && status="!w!open slots $op"
+        lab=${ID2LAB[$id]:-}
+        local keys="-" mem="-" ops="-"
+        [[ -n $lab ]] && { keys=$(commas "${N_KEYS[$lab]}"); mem=$(hb "${N_USED[$lab]}"); ops=$(commas "${N_OPS[$lab]}"); }
+        (( ${#rg} > 60 )) && rg="${rg:0:57}..."
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$shard" "$a${hn:+ ($hn)}" "${id:0:12}" "$cnt" "${rg:--}" "$reps" "$keys" "$mem" "$ops" "$status"
+      done < <(sort -t'|' -k11,11n "$RPT/cluster_nodes.psv")
+    } > "$RPT/topology.tsv"
+  else
+    {
+      printf 'Primary\tReplicas\tKeys\tUsed memory\tOps/s\n'
+      for lab in "${NODES[@]}"; do
+        [[ ${N_ROLE[$lab]} == master ]] || continue
+        x=$(awk -F'\t' 'NR > 1 { st = $2; sub(/^![a-z]!/, "", st); printf "%s%s (%s, lag %s)", (n++ ? ", " : ""), $1, st, $4 }' "$RPT/nodes/${N_DIR[$lab]}/replicas.tsv")
+        printf '%s\t%s\t%s\t%s\t%s\n' "$lab" "${x:-none}" "$(commas "${N_KEYS[$lab]}")" "$(hb "${N_USED[$lab]}")" "$(commas "${N_OPS[$lab]}")"
+      done
+    } > "$RPT/topology.tsv"
+  fi
+
+  # Key configuration (value if identical everywhere, else the variants)
+  {
+    printf 'Parameter\tValue\n'
+    local k v
+    local -A VN=()
+    for k in $KEY_CFG; do
+      [[ -n ${CFGKEYS[$k]:-} ]] || continue
+      (( IS_CLUSTER )) || [[ $k != cluster-* ]] || continue
+      VN=()
+      for lab in "${NODES[@]}"; do v=${CFGALL["$lab|$k"]-}; VN["=$v"]+="$lab "; done
+      if (( ${#VN[@]} == 1 )); then
+        for v in "${!VN[@]}"; do x=${v#=}; printf '%s\t%s\n' "$k" "${x:-\"\"}"; done
+      else
+        local line=""
+        for v in "${!VN[@]}"; do x=${v#=}; line+="${line:+ | }${x:-\"\"} [$(wc -w <<< "${VN[$v]}")]"; done
+        printf '%s\t!w!%s\n' "$k" "$line"
+      fi
+    done
+  } > "$RPT/keycfg.tsv"
+}
+
+analyze() {
+  RPT="$OUTDIR/report"
+  rm -rf "$RPT"; mkdir -p "$RPT/nodes" || die "cannot write to $OUTDIR"
+  FINDINGS="$RPT/findings_raw.tsv"; : > "$FINDINGS"
+  local k v h p dn st reason
+  if [[ -f $OUTDIR/meta.txt ]]; then
+    while IFS='=' read -r k v; do [[ -n $k ]] && M[$k]=$v; done < "$OUTDIR/meta.txt"
+  fi
+  NODES=(); UNREACHABLE=()
+  while IFS=$'\t' read -r h p dn st reason; do
+    [[ -z $h ]] && continue
+    if [[ $st == ok && -d $OUTDIR/nodes/$dn ]]; then NODES+=("$h:$p"); N_DIR["$h:$p"]=$dn
+    else UNREACHABLE+=("$h:$p|${reason:-unreachable}"); fi
+  done < "$OUTDIR/nodes.txt"
+  (( ${#NODES[@]} > 0 )) || die "no collected node in $OUTDIR"
+
+  local lab
+  for lab in "${NODES[@]}"; do
+    log "Analyzing $lab"
+    gen_node "$lab" "${N_DIR[$lab]}"
+  done
+  check_cluster
+  check_groups
+  check_os
+  group_findings
+  order_nodes
+  build_tables
+  MODE="standalone"
+  if (( IS_CLUSTER )); then MODE="cluster"
+  elif (( ${#NODES[@]} > 1 )); then MODE="replication"
+  fi
+  PRODUCT_SUMMARY=$(for lab in "${NODES[@]}"; do echo "${N_PRODUCT[$lab]} ${N_VER[$lab]}"; done | sort | uniq -c | sort -rn |
+    awk '{ printf "%s%s %s%s", (n++ ? ", " : ""), $2, $3, ($1 > 1 ? " (x" $1 ")" : "") }')
+  TOT_USED=0; TOT_KEYS=0; TOT_OPS=0; N_PRIM=0
+  for lab in "${NODES[@]}"; do
+    TOT_OPS=$(( TOT_OPS + ${N_OPS[$lab]:-0} ))
+    if [[ ${N_ROLE[$lab]} == master ]]; then
+      ((N_PRIM++)); TOT_USED=$(( TOT_USED + ${N_USED[$lab]:-0} )); TOT_KEYS=$(( TOT_KEYS + ${N_KEYS[$lab]:-0} ))
+    fi
+  done
+}
+
+# ------------------------------------------------------------ text report ---
+hdr() {
+  local t="# $1 " line
+  printf -v line '%*s' $(( 78 - ${#t} > 3 ? 78 - ${#t} : 3 )) ''
+  printf '%s%s\n' "$t" "${line// /#}"
+}
+tkv() { printf '%24s | %s\n' "$1" "$2"; }
+
+txt_kv() { # FILE
+  [[ -s $1 ]] || return
+  awk -F'\t' '{ v = $2; m = ""; if (v ~ /^![cwo]!/) { if (substr(v, 2, 1) == "c") m = "  <== CRIT"; else if (substr(v, 2, 1) == "w") m = "  <== WARN"; v = substr(v, 4) }
+               printf "%24s | %s%s\n", $1, v, m }' "$1"
+}
+
+txt_table() { # FILE [MAXROWS]
+  [[ -s $1 ]] || return
+  local rows; rows=$(wc -l < "$1")
+  if (( rows <= 1 )); then echo "  (none)"; return; fi
+  awk -F'\t' -v max="${2:-0}" '
+    function clean(v) { if (v ~ /^![cwo]!/) { f = substr(v, 2, 1); v = substr(v, 4); if (f == "c") v = v " !!"; else if (f == "w") v = v " !" } if (length(v) > 70) v = substr(v, 1, 67) "..."; return v }
+    NR == FNR { if (max > 0 && FNR > max + 1) next; for (i = 1; i <= NF; i++) { l = length(clean($i)); if (l > w[i]) w[i] = l }; next }
+    { if (max > 0 && FNR > max + 1) exit
+      line = "  "; for (i = 1; i <= NF; i++) line = line sprintf("%-" w[i] "s  ", clean($i))
+      sub(/ +$/, "", line); print line }' "$1" "$1"
+}
+
+print_text() {
+  local lab r
+  hdr "$TOOL Report"
+  tkv "Date" "${M[collected_at]:-?}"
+  tkv "Tool" "$TOOL ${M[tool_version]:-$VERSION}"
+  tkv "Seed" "${M[seed]:-?}"
+  tkv "Collected from" "${M[collector_host]:-?}"
+  tkv "Mode" "$MODE"
+  tkv "Nodes" "${#NODES[@]} collected, ${#UNREACHABLE[@]} unreachable"
+  tkv "Product" "$PRODUCT_SUMMARY"
+  tkv "Data (primaries)" "$(hb "$TOT_USED") used, $(commas "$TOT_KEYS") keys"
+  tkv "Ops/sec (all nodes)" "$(commas "$TOT_OPS")"
+  tkv "Health score" "$SCORE/100 ($GRADE): $N_CRIT critical, $N_WARN warning, $N_INFO info"
+  hdr "Nodes"
+  txt_table "$RPT/overview.tsv"
+  if (( IS_CLUSTER )); then
+    hdr "Cluster"
+    tkv "State" "${CLUSTER_STATE:-?}"
+    tkv "Shards with slots" "${CLUSTER_SIZE:-?}"
+    tkv "Known nodes" "${CLUSTER_KNOWN:-?}"
+    echo
+    txt_table "$RPT/topology.tsv"
+  elif [[ $MODE == replication ]]; then
+    hdr "Replication"
+    txt_table "$RPT/topology.tsv"
+  fi
+  for lab in "${NODES[@]}"; do
+    r="$RPT/nodes/${N_DIR[$lab]}"
+    hdr "$lab :: Server"; txt_kv "$r/server.kv"
+    hdr "$lab :: Memory"; txt_kv "$r/memory.kv"
+    hdr "$lab :: Persistence"; txt_kv "$r/persistence.kv"
+    hdr "$lab :: Replication"; txt_kv "$r/replication.kv"
+    [[ $(wc -l < "$r/replicas.tsv") -gt 1 ]] && { echo; txt_table "$r/replicas.tsv"; }
+    [[ -s $r/cluster.kv ]] && { hdr "$lab :: Cluster"; txt_kv "$r/cluster.kv"; }
+    hdr "$lab :: Clients"; txt_kv "$r/clients.kv"
+    [[ -s $r/client_ips.tsv ]] && { echo; txt_table "$r/client_ips.tsv" 5; }
+    hdr "$lab :: Stats"; txt_kv "$r/stats.kv"
+    hdr "$lab :: Keyspace"; txt_table "$r/keyspace.tsv"
+    hdr "$lab :: Top commands by total time"; txt_table "$r/cmdstats.tsv" 10
+    hdr "$lab :: Slow log (slowest)"; txt_table "$r/slowlog.tsv" 10
+    [[ $(wc -l < "$r/latency.tsv") -gt 1 ]] && { hdr "$lab :: Latency events"; txt_table "$r/latency.tsv"; }
+  done
+  hdr "Key configuration"
+  txt_table "$RPT/keycfg.tsv"
+  if [[ -s $RPT/config_diff.tsv ]] && (( $(wc -l < "$RPT/config_diff.tsv") > 1 )); then
+    hdr "Configuration differences between nodes"
+    txt_table "$RPT/config_diff.tsv"
+  fi
+  if [[ -s $OUTDIR/os/os.txt ]]; then
+    hdr "Operating system (${OSV[hostname]:-local})"
+    tkv "OS / kernel" "${OSV[os]:-?} / ${OSV[kernel]:-?} (${OSV[arch]:-?})"
+    tkv "CPUs" "${OSV[cpus]:-?} x ${OSV[cpu_model]:-?}"
+    tkv "Memory" "$(hb $(( ${OSV[memtotal]:-0} * 1024 ))) total, $(hb $(( ${OSV[memavailable]:-0} * 1024 ))) available"
+    tkv "Swap" "$(hb $(( ${OSV[swaptotal]:-0} * 1024 ))) total, $(hb $(( (${OSV[swaptotal]:-0} - ${OSV[swapfree]:-0}) * 1024 ))) used"
+    tkv "THP enabled / defrag" "${OSV[thp_enabled]:-?} / ${OSV[thp_defrag]:-?}"
+    tkv "overcommit / swappiness" "${OSV[vm.overcommit_memory]:-?} / ${OSV[vm.swappiness]:-?}"
+    tkv "somaxconn" "${OSV[net.core.somaxconn]:-?}"
+    tkv "Load average" "${OSV[loadavg]:-?}"
+    tkv "Container" "${OSV[container]:-?}"
+  fi
+  hdr "Findings ($N_CRIT critical, $N_WARN warning, $N_INFO info)"
+  if [[ ! -s $RPT/findings.tsv ]]; then
+    echo "  No findings."
+  else
+    local sev area title nodes cnt d1 dall reco
+    while IFS=$'\t' read -r sev area title nodes cnt d1 dall reco; do
+      [[ $nodes == - ]] && nodes=""
+      printf '\n[%s] %s: %s' "$sev" "$area" "$title"
+      (( cnt > 1 )) && printf ' (%s nodes)' "$cnt"
+      printf '\n'
+      if (( cnt > 1 )); then
+        tr '\037' '\n' <<< "$dall" | head -8 | sed 's/^/       /'
+        (( cnt > 8 )) && echo "       ... and $(( cnt - 8 )) more"
+      else
+        printf '       %s%s\n' "${nodes:+$nodes: }" "$d1"
+      fi
+      printf '       Fix: %s\n' "$reco" | fold -s -w 100 | sed '2,$s/^/            /'
+    done < "$RPT/findings.tsv"
+  fi
+  echo
+  hdr "The End"
+}
+
+# ------------------------------------------------------------ HTML report ---
+html_table() { # FILE [ID]
+  if [[ ! -s $1 ]] || (( $(wc -l < "$1") <= 1 )); then echo '<p class="muted">None.</p>'; return; fi
+  awk -F'\t' -v id="$2" '
+    function esc(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); gsub(/"/, "\\&quot;", s); return s }
+    NR == 1 { printf "<div class=\"tw\"><table class=\"data sortable\"%s><thead><tr>", (id != "" ? " id=\"" id "\"" : "")
+              for (i = 1; i <= NF; i++) printf "<th>%s</th>", esc($i); print "</tr></thead><tbody>"; next }
+    { printf "<tr>"
+      for (i = 1; i <= NF; i++) { v = $i; c = ""
+        if (v ~ /^![cwo]!/) { f = substr(v, 2, 1); v = substr(v, 4); c = (f == "c" ? "crit" : (f == "w" ? "warn" : "ok")) }
+        if (v ~ /^-?[0-9][0-9,.]*( ?[KMGTP]?B?|%| ms| s)?$/) c = c " num"
+        printf "<td%s>%s</td>", (c != "" ? " class=\"" c "\"" : ""), esc(v) }
+      print "</tr>" }
+    END { print "</tbody></table></div>" }' "$1"
+}
+
+html_kv() { # FILE TITLE
+  [[ -s $1 ]] || return
+  printf '<div class="card"><h4>%s</h4><table class="kv">' "$(he "$2")"
+  awk -F'\t' '
+    function esc(s) { gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s); return s }
+    { v = $2; c = ""
+      if (v ~ /^![cwo]!/) { f = substr(v, 2, 1); v = substr(v, 4); c = (f == "c" ? " class=\"crit\"" : (f == "w" ? " class=\"warn\"" : " class=\"ok\"")) }
+      printf "<tr><th>%s</th><td%s>%s</td></tr>\n", esc($1), c, esc(v) }' "$1"
+  echo '</table></div>'
+}
+
+html_pre() { # FILE TITLE [open]
+  [[ -s $1 ]] || return
+  printf '<details%s><summary>%s</summary><pre>' "${3:+ open}" "$(he "$2")"
+  sed -e 's/\r$//' -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "$1"
+  echo '</pre></details>'
+}
+
+html_css() {
+  cat <<'EOF'
+<style>
+:root{--bg:#f5f6f8;--panel:#fff;--text:#1c2230;--muted:#5f6878;--border:#e1e4ea;--accent:#2563c9;--head:#f0f2f6;
+--crit:#b42318;--crit-bg:#fdecea;--warn:#9a5b00;--warn-bg:#fff3dc;--info:#1d5fa8;--info-bg:#e7f0fb;--ok:#24753a;--ok-bg:#e6f4ea;--code:#f2f4f7}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1117;--panel:#161b22;--text:#e2e6ec;--muted:#98a2b3;--border:#2b313c;--accent:#6aa0ff;--head:#1c222b;
+--crit:#ff8a80;--crit-bg:#3b1e1e;--warn:#f2b25c;--warn-bg:#3a2b12;--info:#86b7ff;--info-bg:#15263c;--ok:#76d38a;--ok-bg:#15301d;--code:#0f141a}}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
+a{color:var(--accent);text-decoration:none}
+header.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:20px;flex-wrap:wrap;padding:10px 24px;background:var(--panel);border-bottom:1px solid var(--border)}
+header.top .brand{font-weight:700;font-size:15px}
+header.top nav{display:flex;gap:14px;flex-wrap:wrap;font-size:13px}
+main{max-width:1500px;margin:0 auto;padding:20px 24px 60px}
+section{margin-bottom:34px}
+h1{font-size:24px;margin:4px 0 2px}
+h2{font-size:19px;margin:0 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+h3{font-size:16px;margin:22px 0 10px}
+h4{font-size:13px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.muted{color:var(--muted)}
+.meta{display:flex;flex-wrap:wrap;gap:6px 22px;color:var(--muted);font-size:13px;margin-bottom:16px}
+.meta b{color:var(--text);font-weight:600}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.stat{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+.stat .v{font-size:26px;font-weight:700;line-height:1.2}
+.stat .l{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.stat.score .v{font-size:34px}
+.stat.crit .v{color:var(--crit)}.stat.warn .v{color:var(--warn)}.stat.info .v{color:var(--info)}
+.g-Good{color:var(--ok)}.g-Fair{color:var(--warn)}.g-Poor,.g-Critical{color:var(--crit)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px;min-width:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:14px}
+.tw{overflow-x:auto;background:var(--panel);border:1px solid var(--border);border-radius:10px}
+table{border-collapse:collapse;width:100%}
+table.data th,table.data td{padding:6px 10px;border-bottom:1px solid var(--border);text-align:left;vertical-align:top;white-space:nowrap}
+table.data td{white-space:normal;word-break:break-word}
+table.data thead th{background:var(--head);font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);position:sticky;top:0}
+table.sortable thead th{cursor:pointer;user-select:none}
+table.sortable thead th[data-dir=asc]::after{content:" \25B2";font-size:9px}
+table.sortable thead th[data-dir=desc]::after{content:" \25BC";font-size:9px}
+table.data tbody tr:hover{background:var(--head)}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+table.kv th{width:42%;text-align:left;font-weight:500;color:var(--muted);padding:4px 8px 4px 0;vertical-align:top}
+table.kv td{padding:4px 0;word-break:break-word}
+table.kv tr+tr th,table.kv tr+tr td{border-top:1px dashed var(--border)}
+td.crit,table.kv td.crit{color:var(--crit);background:var(--crit-bg);font-weight:600}
+td.warn,table.kv td.warn{color:var(--warn);background:var(--warn-bg);font-weight:600}
+td.ok{color:var(--ok)}
+.sev{display:inline-block;min-width:44px;text-align:center;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:700}
+.sev.CRIT{background:var(--crit-bg);color:var(--crit)}.sev.WARN{background:var(--warn-bg);color:var(--warn)}.sev.INFO{background:var(--info-bg);color:var(--info)}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.toolbar button{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:5px 12px;border-radius:999px;cursor:pointer;font-size:13px}
+.toolbar button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+input.filter,select.nodesel{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:6px 10px;border-radius:8px;font-size:13px;min-width:240px}
+.finding td.reco{color:var(--text)}
+.finding td.det{color:var(--muted)}
+.fnd td:nth-child(1),.fnd td:nth-child(2){white-space:nowrap}.fnd td:nth-child(3){min-width:160px}.fnd td:nth-child(4){max-width:220px}
+details{margin:8px 0}
+details summary{cursor:pointer;color:var(--accent)}
+pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:10px 12px;overflow:auto;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;max-height:520px}
+.node{display:none}.node.show{display:block}
+.node h3 .role{font-size:12px;font-weight:600;color:var(--muted);margin-left:8px}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+footer{color:var(--muted);font-size:12px;text-align:center;padding:20px}
+@media print{header.top{position:static}.node{display:block!important}details{display:block}}
+</style>
+EOF
+}
+
+html_js() {
+  cat <<'EOF'
+<script>
+(function(){
+  function val(t){t=t.replace(/,/g,'').trim();var m=t.match(/^(-?\d+(?:\.\d+)?)\s*([KMGTP]?)B?\s*(%|ms|s)?$/);if(!m)return null;
+    var mul={'':1,K:1024,M:1048576,G:1073741824,T:1099511627776,P:1125899906842624}[m[2]];return parseFloat(m[1])*mul;}
+  document.querySelectorAll('table.sortable thead th').forEach(function(th){
+    th.addEventListener('click',function(){
+      var table=th.closest('table'),tb=table.tBodies[0],idx=Array.prototype.indexOf.call(th.parentNode.children,th);
+      var asc=th.getAttribute('data-dir')!=='asc';
+      table.querySelectorAll('thead th').forEach(function(h){h.removeAttribute('data-dir');});
+      th.setAttribute('data-dir',asc?'asc':'desc');
+      var rows=Array.prototype.slice.call(tb.rows);
+      rows.sort(function(a,b){var x=a.cells[idx]?a.cells[idx].textContent:'',y=b.cells[idx]?b.cells[idx].textContent:'';
+        var nx=val(x),ny=val(y),r=(nx!==null&&ny!==null)?nx-ny:x.localeCompare(y);return asc?r:-r;});
+      rows.forEach(function(r){tb.appendChild(r);});
+    });
+  });
+  var sevBtns=document.querySelectorAll('#sevfilter button'),fsearch=document.getElementById('fsearch');
+  function applyFindings(){
+    var on=document.querySelector('#sevfilter button.on'),sev=on?on.getAttribute('data-sev'):'ALL',q=(fsearch&&fsearch.value||'').toLowerCase();
+    document.querySelectorAll('tr.finding').forEach(function(tr){
+      var ok=(sev==='ALL'||tr.getAttribute('data-sev')===sev)&&(!q||tr.textContent.toLowerCase().indexOf(q)>=0);
+      tr.style.display=ok?'':'none';});
+  }
+  sevBtns.forEach(function(b){b.addEventListener('click',function(){sevBtns.forEach(function(x){x.classList.remove('on');});b.classList.add('on');applyFindings();});});
+  if(fsearch)fsearch.addEventListener('input',applyFindings);
+  document.querySelectorAll('input.filter[data-table]').forEach(function(inp){
+    inp.addEventListener('input',function(){var t=document.getElementById(inp.getAttribute('data-table')),q=inp.value.toLowerCase();
+      if(!t)return;Array.prototype.forEach.call(t.tBodies[0].rows,function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)>=0?'':'none';});});
+  });
+  var sel=document.getElementById('nodesel');
+  function showNode(){var v=sel.value;document.querySelectorAll('.node').forEach(function(n){n.classList.toggle('show',v==='__all'||n.id===v);});}
+  if(sel){sel.addEventListener('change',showNode);showNode();}
+  document.querySelectorAll('a[data-node]').forEach(function(a){a.addEventListener('click',function(){if(sel){sel.value=a.getAttribute('data-node');showNode();}});});
+})();
+</script>
+EOF
+}
+
+write_html() {
+  local lab r i=0 nid
+  {
+    printf '<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n'
+    printf '<title>Valkey Health Report - %s</title>\n' "$(he "${M[seed]:-}")"
+    html_css
+    printf '</head><body>\n'
+    printf '<header class="top"><div class="brand">%s</div><nav>' "$TOOL"
+    printf '<a href="#summary">Summary</a><a href="#findings">Findings</a><a href="#topology">Topology</a><a href="#nodes">Nodes</a><a href="#config">Configuration</a><a href="#details">Node details</a>'
+    [[ -s $OUTDIR/os/os.txt ]] && printf '<a href="#os">OS</a>'
+    printf '</nav></header>\n<main>\n'
+
+    # Summary
+    printf '<section id="summary"><h1>Valkey / Redis health report</h1>\n<div class="meta">'
+    printf '<span>Seed <b>%s</b></span><span>Mode <b>%s</b></span><span>Collected <b>%s</b></span><span>From <b>%s</b></span><span>Product <b>%s</b></span><span>Tool <b>%s %s</b></span>' \
+      "$(he "${M[seed]:-?}")" "$MODE" "$(he "${M[collected_at]:-?}")" "$(he "${M[collector_host]:-?}")" "$(he "$PRODUCT_SUMMARY")" "$TOOL" "$(he "${M[tool_version]:-$VERSION}")"
+    printf '</div>\n<div class="cards">'
+    printf '<div class="stat score"><div class="l">Health score</div><div class="v g-%s">%s</div><div class="muted">%s</div></div>' "$GRADE" "$SCORE" "$GRADE"
+    printf '<div class="stat crit"><div class="l">Critical</div><div class="v">%s</div></div>' "$N_CRIT"
+    printf '<div class="stat warn"><div class="l">Warning</div><div class="v">%s</div></div>' "$N_WARN"
+    printf '<div class="stat info"><div class="l">Info</div><div class="v">%s</div></div>' "$N_INFO"
+    printf '<div class="stat"><div class="l">Nodes</div><div class="v">%s</div><div class="muted">%s primaries%s</div></div>' "${#NODES[@]}" "$N_PRIM" \
+      "$( (( ${#UNREACHABLE[@]} )) && printf ', %s unreachable' "${#UNREACHABLE[@]}")"
+    printf '<div class="stat"><div class="l">Data on primaries</div><div class="v">%s</div><div class="muted">%s keys</div></div>' "$(hb "$TOT_USED")" "$(commas "$TOT_KEYS")"
+    printf '<div class="stat"><div class="l">Ops/sec</div><div class="v">%s</div><div class="muted">all nodes, at collection</div></div>' "$(commas "$TOT_OPS")"
+    (( IS_CLUSTER )) && printf '<div class="stat"><div class="l">Cluster state</div><div class="v %s">%s</div><div class="muted">%s shards, %s known nodes</div></div>' \
+      "$( [[ $CLUSTER_STATE == ok ]] && echo g-Good || echo g-Critical)" "$(he "$CLUSTER_STATE")" "$(he "$CLUSTER_SIZE")" "$(he "$CLUSTER_KNOWN")"
+    printf '</div></section>\n'
+
+    # Findings
+    printf '<section id="findings"><h2>Findings and recommendations</h2>\n'
+    printf '<div class="toolbar" id="sevfilter"><button class="on" data-sev="ALL">All (%s)</button><button data-sev="CRIT">Critical (%s)</button><button data-sev="WARN">Warning (%s)</button><button data-sev="INFO">Info (%s)</button>' \
+      $(( N_CRIT + N_WARN + N_INFO )) "$N_CRIT" "$N_WARN" "$N_INFO"
+    printf '<input class="filter" id="fsearch" placeholder="Search findings..."></div>\n'
+    if [[ -s $RPT/findings.tsv ]]; then
+      printf '<div class="tw"><table class="data fnd"><thead><tr><th>Severity</th><th>Area</th><th>Finding</th><th>Nodes</th><th>Details</th><th>Recommendation</th></tr></thead><tbody>\n'
+      local sev area title nodes cnt d1 dall reco
+      while IFS=$'\t' read -r sev area title nodes cnt d1 dall reco; do
+        [[ $nodes == - ]] && nodes=""
+        printf '<tr class="finding" data-sev="%s"><td><span class="sev %s">%s</span></td><td>%s</td><td><b>%s</b></td><td>%s</td><td class="det">' \
+          "$sev" "$sev" "$sev" "$(he "$area")" "$(he "$title")" "$(he "${nodes:-cluster}")"
+        if (( cnt > 1 )); then
+          printf '%s<details><summary>all %s nodes</summary>' "$(he "$d1")" "$cnt"
+          tr '\037' '\n' <<< "$dall" | while IFS= read -r x; do printf '%s<br>' "$(he "$x")"; done
+          printf '</details>'
+        else
+          printf '%s' "$(he "$d1")"
+        fi
+        printf '</td><td class="reco">%s</td></tr>\n' "$(he "$reco")"
+      done < "$RPT/findings.tsv"
+      printf '</tbody></table></div>\n'
+    else
+      printf '<p>No findings.</p>\n'
+    fi
+    printf '</section>\n'
+
+    # Topology
+    printf '<section id="topology"><h2>Topology</h2>\n'
+    if (( IS_CLUSTER )); then printf '<p class="muted">Cluster view from %s (CLUSTER NODES). Shards are ordered by their first slot.</p>\n' "$(he "$SEED_LAB")"
+    else printf '<p class="muted">Primaries and their replicas (INFO replication).</p>\n'; fi
+    html_table "$RPT/topology.tsv"
+    printf '</section>\n'
+
+    # Overview
+    printf '<section id="nodes"><h2>Nodes</h2>\n'
+    html_table "$RPT/overview.tsv"
+    printf '</section>\n'
+
+    # Configuration
+    printf '<section id="config"><h2>Configuration</h2><div class="two"><div><h3>Key parameters</h3>\n'
+    html_table "$RPT/keycfg.tsv"
+    printf '<p class="muted">When nodes differ, each value is followed by [number of nodes].</p></div>\n'
+    if [[ -s $RPT/config_diff.tsv ]]; then
+      printf '<div><h3>Differences between nodes</h3>\n'
+      html_table "$RPT/config_diff.tsv"
+      printf '<p class="muted">Node-specific parameters (ports, files, announce addresses) are excluded.</p></div>\n'
+    fi
+    printf '</div></section>\n'
+
+    # Node details
+    printf '<section id="details"><h2>Node details</h2>\n<div class="toolbar"><select id="nodesel" class="nodesel">'
+    i=0
+    for lab in "${NODES[@]}"; do
+      ((i++)); printf '<option value="n%s">%s (%s)</option>' "$i" "$(he "$lab")" "${N_ROLE[$lab]/slave/replica}"
+    done
+    printf '<option value="__all">Show all nodes</option></select></div>\n'
+    i=0
+    for lab in "${NODES[@]}"; do
+      ((i++)); nid="n$i"; r="$RPT/nodes/${N_DIR[$lab]}"; local d="$OUTDIR/nodes/${N_DIR[$lab]}"
+      printf '<div class="node" id="%s"><h3>%s<span class="role">%s · %s %s</span></h3>\n' "$nid" "$(he "$lab")" "${N_ROLE[$lab]/slave/replica}" "${N_PRODUCT[$lab]}" "$(he "${N_VER[$lab]}")"
+      printf '<div class="grid">'
+      html_kv "$r/server.kv" "Server"
+      html_kv "$r/memory.kv" "Memory"
+      html_kv "$r/persistence.kv" "Persistence"
+      html_kv "$r/replication.kv" "Replication"
+      html_kv "$r/cluster.kv" "Cluster"
+      html_kv "$r/clients.kv" "Clients"
+      html_kv "$r/stats.kv" "Stats"
+      printf '</div>\n'
+      if (( $(wc -l < "$r/replicas.tsv") > 1 )); then printf '<h3>Replicas</h3>'; html_table "$r/replicas.tsv"; fi
+      printf '<h3>Keyspace</h3>'; html_table "$r/keyspace.tsv"
+      printf '<h3>Top commands by total time</h3>'; html_table "$r/cmdstats.tsv"
+      printf '<div class="two"><div><h3>Error replies</h3>'; html_table "$r/errorstats.tsv"; printf '</div>'
+      printf '<div><h3>Latency events</h3>'; html_table "$r/latency.tsv"; printf '</div></div>\n'
+      printf '<div class="two"><div><h3>Slow log by command</h3>'; html_table "$r/slowlog_summary.tsv"; printf '</div>'
+      printf '<div><h3>Memory stats</h3>'; html_table "$r/memory_stats.tsv"; printf '</div></div>\n'
+      printf '<h3>Slow log (slowest 50)</h3>'; html_table "$r/slowlog.tsv"
+      if [[ -s $r/client_ips.tsv ]]; then
+        printf '<h3>Clients</h3><div class="two"><div>'; html_table "$r/client_ips.tsv"; printf '</div><div>'; html_table "$r/client_names.tsv"
+        printf '</div><div>'; html_table "$r/client_cmds.tsv"; printf '</div><div>'; html_table "$r/client_users.tsv"; printf '</div></div>\n'
+      fi
+      printf '<h3>Diagnostics</h3>'
+      html_pre "$d/latency_doctor.txt" "LATENCY DOCTOR"
+      html_pre "$d/memory_doctor.txt" "MEMORY DOCTOR"
+      html_pre "$d/bigkeys.txt" "--bigkeys"
+      html_pre "$d/memkeys.txt" "--memkeys"
+      html_pre "$d/commandlog_large_request.txt" "COMMANDLOG large-request"
+      html_pre "$d/commandlog_large_reply.txt" "COMMANDLOG large-reply"
+      html_pre "$d/module_list.txt" "MODULE LIST"
+      html_pre "$d/acl.txt" "ACL LIST (secrets redacted)"
+      html_pre "$d/cluster_nodes.txt" "CLUSTER NODES"
+      local e
+      for e in "$d"/*.err; do [[ -e $e ]] && html_pre "$e" "Error: $(basename "$e" .err)"; done
+      if [[ -s $d/config.txt ]]; then
+        printf '<details><summary>Full configuration (%s parameters)</summary><input class="filter" data-table="cfg%s" placeholder="Filter parameters...">' "$(wc -l < "$d/config.txt")" "$i"
+        { printf 'Parameter\tValue\n'; sort "$d/config.txt"; } > "$r/config_full.tsv"
+        html_table "$r/config_full.tsv" "cfg$i"
+        printf '</details>\n'
+      fi
+      html_pre "$d/info.txt" "Raw INFO"
+      printf '</div>\n'
+    done
+    printf '</section>\n'
+
+    # OS
+    if [[ -s $OUTDIR/os/os.txt ]]; then
+      printf '<section id="os"><h2>Operating system (%s)</h2><div class="grid">' "$(he "${OSV[hostname]:-local}")"
+      {
+        kvp "OS" "${OSV[os]:-?}"
+        kvp "Kernel" "${OSV[kernel]:-?} (${OSV[arch]:-?})"
+        kvp "CPUs" "${OSV[cpus]:-?} x ${OSV[cpu_model]:-?}"
+        kvp "NUMA nodes" "${OSV[numa_nodes]:-?}"
+        kvp "Memory" "$(hb $(( ${OSV[memtotal]:-0} * 1024 ))) total, $(hb $(( ${OSV[memavailable]:-0} * 1024 ))) available"
+        kvp "Swap" "$(hb $(( ${OSV[swaptotal]:-0} * 1024 ))) total, $(hb $(( (${OSV[swaptotal]:-0} - ${OSV[swapfree]:-0}) * 1024 ))) used"
+        local t=${OSV[thp_enabled]:-?}; [[ $t == *"[always]"* ]] && t="!w!$t"
+        kvp "THP enabled" "$t"
+        kvp "THP defrag" "${OSV[thp_defrag]:-?}"
+        t=${OSV[vm.overcommit_memory]:-?}; [[ $t != 1 ]] && t="!w!$t"
+        kvp "vm.overcommit_memory" "$t"
+        kvp "vm.swappiness" "${OSV[vm.swappiness]:-?}"
+        kvp "net.core.somaxconn" "${OSV[net.core.somaxconn]:-?}"
+        kvp "tcp_max_syn_backlog" "${OSV[net.ipv4.tcp_max_syn_backlog]:-?}"
+        kvp "Load average" "${OSV[loadavg]:-?}"
+        kvp "Uptime" "$(hdur "${OSV[uptime_sec]:-0}")"
+        kvp "Container" "${OSV[container]:-?}${OSV[cgroup_memory_limit]:+ (memory limit ${OSV[cgroup_memory_limit]})}"
+      } > "$RPT/os.kv"
+      html_kv "$RPT/os.kv" "Host"
+      printf '</div>'
+      html_pre "$OUTDIR/os/ps.txt" "Valkey / Redis processes" open
+      html_pre "$OUTDIR/os/df.txt" "Filesystems"
+      html_pre "$OUTDIR/os/free.txt" "free -m"
+      printf '</section>\n'
+    fi
+
+    printf '</main><footer>Generated by %s %s on %s. Raw data: %s</footer>\n' "$TOOL" "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S UTC')" "$(he "$OUTDIR")"
+    html_js
+    printf '</body></html>\n'
+  } > "$HTML"
+}
+
+# ------------------------------------------------------------------- main ---
+main() {
+  parse_args "$@"
+
+  if [[ -n $FROM_DIR ]]; then
+    [[ -f $FROM_DIR/nodes.txt ]] || die "$FROM_DIR does not look like a $TOOL collection (nodes.txt missing)"
+    OUTDIR=${FROM_DIR%/}
+  else
+    find_cli
+    if (( ASK_PASS )); then
+      read -rsp "Password: " PASSWORD < /dev/tty || die "cannot read password"
+      echo >&2
+    fi
+    [[ -z $OUTDIR ]] && OUTDIR="./${TOOL}_${HOST//[^A-Za-z0-9._-]/_}_${PORT}_$(date +%Y%m%d_%H%M%S)"
+    [[ -e $OUTDIR && -n $(ls -A "$OUTDIR" 2>/dev/null) ]] && die "output directory $OUTDIR exists and is not empty"
+    umask 077
+    log "$TOOL $VERSION: seed $HOST:$PORT, output $OUTDIR"
+    collect_all
+    if (( COLLECT_ONLY )); then
+      local parent base
+      parent=$(dirname "$OUTDIR"); base=$(basename "$OUTDIR")
+      tar -czf "$OUTDIR.tar.gz" -C "$parent" "$base" || die "could not create $OUTDIR.tar.gz"
+      log "Collection done: $OUTDIR.tar.gz"
+      echo "$OUTDIR.tar.gz"
+      exit 0
+    fi
+  fi
+
+  [[ -z $HTML ]] && HTML="$OUTDIR/report.html"
+  analyze
+  (( TEXT )) && print_text
+  write_html
+  log "HTML report: $HTML"
+  log "Raw data:    $OUTDIR"
+}
+
+main "$@"
