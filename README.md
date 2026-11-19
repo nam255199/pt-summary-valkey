@@ -105,18 +105,6 @@ Findings that repeat on several nodes are grouped. The health score starts at 10
   os/                   os.txt df.txt free.txt ps.txt (local)
   report/               derived tables + findings.tsv
   report.html
-```
-
-## Testing
-
-`test/` contains a Docker lab: a standalone node, a primary/replica pair and a 6-node cluster.
-
-```bash
-test/run-tests.sh        # start the lab, load data, run every mode; reports go to test/out/*/report.html
-test/run-tests.sh down   # remove the lab
-```
-
-## Roadmap
 
 - Kubernetes: collect from the pods of the Valkey operators/Helm charts (`kubectl exec`), and include pod
   resources and limits.
