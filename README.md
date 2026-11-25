@@ -94,6 +94,8 @@ Findings that repeat on several nodes are grouped. The health score starts at 10
   config (filterable) and raw INFO.
 - One self-contained file (no external resources), sortable tables, light/dark theme, printable.
 
+<img width="1894" height="944" alt="image" src="https://github.com/user-attachments/assets/123d7eb4-0df0-4d75-bf27-0a66dbf0bbf5" />
+
 ## Raw data layout
 
 ```
