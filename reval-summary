@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pt-summary-valkey - Summarize and health-check Valkey / Redis OSS deployments.
+# reval-summary - Summarize and health-check Valkey / Redis OSS deployments.
 #
 # Connects to a standalone instance, a primary/replica group or a cluster,
 # collects INFO, CONFIG, CLUSTER, SLOWLOG, LATENCY, MEMORY, CLIENT and ACL
@@ -8,11 +8,11 @@
 # pt-summary style text report and writes a self-contained HTML report.
 #
 # Requirements: bash >= 4.2, awk, sed, sort, valkey-cli or redis-cli.
-# Run "pt-summary-valkey --help" for usage.
+# Run "reval-summary --help" for usage.
 #
 if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] ||
    { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
-  echo "pt-summary-valkey: bash >= 4.2 is required" >&2
+  echo "reval-summary: bash >= 4.2 is required" >&2
   exit 1
 fi
 
@@ -22,7 +22,7 @@ export LC_ALL=C
 export TZ=UTC
 
 readonly VERSION="1.0"
-readonly TOOL="pt-summary-valkey"
+readonly TOOL="reval-summary"
 
 # --------------------------------------------------------------- defaults ---
 HOST="127.0.0.1"

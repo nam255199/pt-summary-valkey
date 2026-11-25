@@ -1,4 +1,4 @@
-# pt-summary-valkey
+# reval-summary
 
 A `pt-summary`-style summary and health check for **Valkey** and **Redis OSS**.
 It works on a standalone instance, a primary/replica group or a cluster. It prints a
@@ -16,27 +16,27 @@ spirit of `pg_gather`) with findings and recommendations for DBAs and support en
 
 ```bash
 # Standalone or replication group
-VALKEYCLI_AUTH='secret' ./pt-summary-valkey -h 10.0.0.5 -p 6379
+VALKEYCLI_AUTH='secret' ./reval-summary -h 10.0.0.5 -p 6379
 
 # Cluster: any node works as the seed
-./pt-summary-valkey -h node1 -p 7000 --user monitor --ask-pass
+./reval-summary -h node1 -p 7000 --user monitor --ask-pass
 
 # TLS
-./pt-summary-valkey -h node1 -p 6380 --tls --cacert ca.crt --ask-pass
+./reval-summary -h node1 -p 6380 --tls --cacert ca.crt --ask-pass
 ```
 
-Output: the text report on stdout, plus `./pt-summary-valkey_<host>_<port>_<timestamp>/report.html` and the raw data.
+Output: the text report on stdout, plus `./reval-summary_<host>_<port>_<timestamp>/report.html` and the raw data.
 
 ### Customer / support workflow
 
 ```bash
 # collect only, then send the .tar.gz
-./pt-summary-valkey -h 10.0.0.5 -p 6379 --ask-pass --collect-only
-# -> ./pt-summary-valkey_10.0.0.5_6379_20261119_101500.tar.gz
+./reval-summary -h 10.0.0.5 -p 6379 --ask-pass --collect-only
+# -> ./reval-summary_10.0.0.5_6379_20261119_101500.tar.gz
 
 # build the reports offline
-tar xzf pt-summary-valkey_10.0.0.5_6379_20261119_101500.tar.gz
-./pt-summary-valkey --from-dir pt-summary-valkey_10.0.0.5_6379_20261119_101500
+tar xzf reval-summary_10.0.0.5_6379_20261119_101500.tar.gz
+./reval-summary --from-dir reval-summary_10.0.0.5_6379_20261119_101500
 ```
 
 Run the tool on one of the Valkey hosts to also collect OS settings (THP, overcommit,
@@ -59,7 +59,7 @@ automatically when a node runs on the local host. Use `--os` / `--no-os` to forc
 Minimal ACL user for the tool:
 
 ```
-ACL SETUSER pt-summary on >password -@all +ping +info +config|get +cluster|info +cluster|nodes
+ACL SETUSER reval-summary on >password -@all +ping +info +config|get +cluster|info +cluster|nodes
   +slowlog|get +slowlog|len +latency|latest +latency|doctor +memory|doctor +memory|stats
   +client|list +acl|list +module|list +commandlog|get
 ```
