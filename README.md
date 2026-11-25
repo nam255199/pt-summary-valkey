@@ -111,4 +111,3 @@ Findings that repeat on several nodes are grouped. The health score starts at 10
 - Kubernetes: collect from the pods of the Valkey operators/Helm charts (`kubectl exec`), and include pod
   resources and limits.
 - Sentinel: topology, quorum and configuration checks.
-- Read `valkey-ftdc` / log data for trends over time.
